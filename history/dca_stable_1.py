@@ -182,13 +182,7 @@ def convert_df_to_csv(df):
 # =========================================================
 # Fit Engine
 # =========================================================
-def fit_decline(
-    df,
-    fit_mask,
-    forecast_years=10,
-    forecast_start_rate=None,
-    forecast_uplifts=None,
-):
+def fit_decline(df, fit_mask, forecast_years=10, forecast_start_rate=None):
     """Fit Arps on selected history and forecast from end of full history."""
     fit_df = df.loc[fit_mask].copy().sort_values("Date")
     if fit_df.empty or len(fit_df) < 5:
@@ -241,30 +235,10 @@ def fit_decline(
         freq="MS",
     )[1:]
     t_fore = (forecast_dates - t0).total_seconds() / YEAR_SECONDS
-    forecast_rate_base = arps_rate(t_fore, **used_params)
+    forecast_rate = arps_rate(t_fore, **used_params)
 
     forecast_plot_dates = pd.DatetimeIndex([forecast_start_date]).append(pd.DatetimeIndex(forecast_dates))
-    forecast_plot_rate_base = np.concatenate(([q_start], forecast_rate_base))
-
-    # Optional uplift activities:
-    # Add full event rate at its date, then carry that added component forward
-    # with the same decline trend as the main forecast.
-    uplift_plot_rate = np.zeros(len(forecast_plot_dates), dtype=float)
-    if forecast_uplifts:
-        plot_dates = pd.to_datetime(pd.Series(forecast_plot_dates)).to_numpy(dtype="datetime64[ns]")
-        for ev in forecast_uplifts:
-            ev_date = pd.to_datetime(ev.get("date"))
-            ev_rate = float(ev.get("rate", 0.0))
-            if not np.isfinite(ev_rate) or ev_rate <= 0:
-                continue
-            ev_dt = np.datetime64(ev_date)
-            idx = int(np.searchsorted(plot_dates, ev_dt, side="left"))
-            if 0 <= idx < len(uplift_plot_rate):
-                base_at_event = max(float(forecast_plot_rate_base[idx]), 1e-12)
-                uplift_plot_rate[idx:] += ev_rate * (forecast_plot_rate_base[idx:] / base_at_event)
-
-    forecast_plot_rate = forecast_plot_rate_base + uplift_plot_rate
-    forecast_rate = forecast_plot_rate[1:]
+    forecast_plot_rate = np.concatenate(([q_start], forecast_rate))
 
     combined_dates = pd.concat([df["Date"], pd.Series(forecast_dates)], ignore_index=True)
     combined_rates = pd.concat([df["OIL"], pd.Series(forecast_rate)], ignore_index=True)
@@ -285,13 +259,9 @@ def fit_decline(
         "hist_actual_cum": hist_actual_cum,
         "forecast_start_rate": q_start,
         "forecast_dates": forecast_dates,
-        "forecast_rate_base": forecast_rate_base,
-        "forecast_rate_uplift": uplift_plot_rate[1:],
         "forecast_rate": forecast_rate,
         "forecast_cum": forecast_cum,
         "forecast_plot_dates": forecast_plot_dates,
-        "forecast_plot_rate_base": forecast_plot_rate_base,
-        "forecast_plot_rate_uplift": uplift_plot_rate,
         "forecast_plot_rate": forecast_plot_rate,
         "forecast_plot_cum": forecast_plot_cum,
     }
@@ -454,35 +424,6 @@ def apply_liquid_rate_schedule(forecast_dates, schedule_starts, schedule_rates):
         if idx < 0:
             idx = 0
         out[i] = rates[idx]
-    return out
-
-
-def apply_step_rate_adjustments(dates, event_dates, event_deltas):
-    """
-    Build cumulative step-rate adjustment by date.
-    Each delta is applied from its effective date onward.
-    """
-    if len(event_dates) == 0 or len(event_deltas) == 0:
-        return np.zeros(len(dates), dtype=float)
-    if len(event_dates) != len(event_deltas):
-        raise ValueError("Step-adjustment dates and deltas count mismatch.")
-
-    starts = pd.to_datetime(pd.Series(event_dates)).to_numpy(dtype="datetime64[ns]")
-    deltas = np.asarray(event_deltas, dtype=float)
-    if np.any(~np.isfinite(deltas)):
-        raise ValueError("Step-adjustment deltas must be finite numbers.")
-
-    order = np.argsort(starts)
-    starts = starts[order]
-    deltas = deltas[order]
-    cum_deltas = np.cumsum(deltas)
-
-    x_dates = pd.to_datetime(pd.Series(dates)).to_numpy(dtype="datetime64[ns]")
-    idx = np.searchsorted(starts, x_dates, side="right") - 1
-    out = np.zeros(len(x_dates), dtype=float)
-    valid = idx >= 0
-    if np.any(valid):
-        out[valid] = cum_deltas[idx[valid]]
     return out
 
 
@@ -684,105 +625,16 @@ forecast_years = st.sidebar.number_input(
 use_log_scale = st.sidebar.checkbox("Use log scale for oil rate", value=False)
 
 df = oil_df.copy().sort_values("Date").reset_index(drop=True)
+df["CumOil"] = running_cumulative(df["Date"], df["OIL"])
 if "WATER" not in df.columns:
     df["WATER"] = np.nan
-df["OIL_RAW"] = df["OIL"].astype(float)
-
-min_date = df["Date"].min().date()
-max_date = df["Date"].max().date()
-last_hist_date = pd.to_datetime(df["Date"].iloc[-1])
-
-with st.sidebar.expander("Managed-rate adjustments"):
-    use_hist_steps = st.checkbox(
-        "Apply historical step adjustments",
-        value=False,
-        help="Each delta is cumulative from its date onward. Use negative values to subtract rate.",
-    )
-    n_hist_steps = int(
-        st.number_input(
-            "Historical step events",
-            min_value=0,
-            max_value=20,
-            value=0,
-            step=1,
-            key="n_hist_steps",
-        )
-    )
-    hist_step_dates = []
-    hist_step_deltas = []
-    if use_hist_steps and n_hist_steps > 0:
-        for i in range(n_hist_steps):
-            c1, c2 = st.columns(2)
-            d = c1.date_input(
-                f"Hist step {i + 1} date",
-                value=min_date,
-                min_value=min_date,
-                max_value=max_date,
-                key=f"hist_step_date_{i}",
-            )
-            v = c2.number_input(
-                f"Delta {i + 1}",
-                value=0.0,
-                step=10.0,
-                format="%.3f",
-                key=f"hist_step_delta_{i}",
-            )
-            hist_step_dates.append(pd.to_datetime(d))
-            hist_step_deltas.append(float(v))
-
-    use_forecast_uplifts = st.checkbox(
-        "Apply forecast uplift events",
-        value=False,
-        help="Each event adds full rate at event date, then that added stream follows the same decline trend as main forecast.",
-    )
-    n_forecast_uplifts = int(
-        st.number_input(
-            "Forecast uplift events",
-            min_value=0,
-            max_value=20,
-            value=0,
-            step=1,
-            key="n_forecast_uplifts",
-        )
-    )
-    forecast_uplifts = []
-    if use_forecast_uplifts and n_forecast_uplifts > 0:
-        min_forecast_event_date = (last_hist_date + pd.DateOffset(days=1)).date()
-        for i in range(n_forecast_uplifts):
-            c1, c2 = st.columns(2)
-            suggested = (last_hist_date + pd.DateOffset(years=i + 1)).date()
-            d = c1.date_input(
-                f"Uplift {i + 1} date",
-                value=suggested,
-                min_value=min_forecast_event_date,
-                key=f"forecast_uplift_date_{i}",
-            )
-            v = c2.number_input(
-                f"Rate {i + 1}",
-                min_value=0.0,
-                value=0.0,
-                step=10.0,
-                format="%.3f",
-                key=f"forecast_uplift_rate_{i}",
-            )
-            forecast_uplifts.append({"date": pd.to_datetime(d), "rate": float(v)})
-
-hist_adjust_active = use_hist_steps and len(hist_step_dates) > 0
-if hist_adjust_active:
-    df["Hist_Adjustment"] = apply_step_rate_adjustments(df["Date"], hist_step_dates, hist_step_deltas)
-else:
-    df["Hist_Adjustment"] = 0.0
-
-df["OIL"] = np.clip(df["OIL_RAW"] + df["Hist_Adjustment"], 0.0, np.inf)
-if hist_adjust_active and int((df["OIL"] <= 0).sum()) > 0:
-    st.sidebar.warning("Some adjusted historical oil rates are <= 0 and will be ignored by decline fitting.")
-active_forecast_uplifts = [ev for ev in forecast_uplifts if float(ev.get("rate", 0.0)) > 0]
-
-df["CumOil"] = running_cumulative(df["Date"], df["OIL"])
 df["WOR"] = np.where((df["OIL"] > 0) & (df["WATER"] >= 0), df["WATER"] / df["OIL"], np.nan)
 df["WaterCut"] = np.where(np.isfinite(df["WOR"]) & (df["WOR"] >= 0), watercut_from_wor(df["WOR"]), np.nan)
 df["lnWOR"] = np.where(df["WOR"] > 0, np.log(df["WOR"]), np.nan)
 df["PointID"] = df.index.astype(int)
+
+min_date = df["Date"].min().date()
+max_date = df["Date"].max().date()
 
 fit_window_mode = st.sidebar.radio(
     "Fit window source",
@@ -852,7 +704,6 @@ with tab1:
             fit_mask_1,
             forecast_years=forecast_years,
             forecast_start_rate=tab1_start_rate,
-            forecast_uplifts=forecast_uplifts if use_forecast_uplifts else None,
         )
         fit_error_1 = None
     except Exception as exc:
@@ -879,7 +730,7 @@ with tab1:
             x=df["Date"],
             y=df["OIL"],
             mode="markers",
-            name="Historical Oil Rate (managed)",
+            name="Historical Oil Rate",
             customdata=df["PointID"],
             marker={"size": 8, "color": marker_colors},
             hovertemplate="Date=%{x|%Y-%m-%d}<br>Rate=%{y:.2f}<extra></extra>",
@@ -887,20 +738,6 @@ with tab1:
         row=1,
         col=1,
     )
-
-    if hist_adjust_active:
-        fig1.add_trace(
-            go.Scatter(
-                x=df["Date"],
-                y=df["OIL_RAW"],
-                mode="markers",
-                name="Historical Oil Rate (raw)",
-                marker={"size": 6, "color": "rgba(120,120,120,0.45)"},
-                hovertemplate="Date=%{x|%Y-%m-%d}<br>Raw rate=%{y:.2f}<extra></extra>",
-            ),
-            row=1,
-            col=1,
-        )
 
     if result_1 is not None:
         fig1.add_trace(
@@ -976,13 +813,6 @@ with tab1:
         selection_mode=("points", "box", "lasso"),
     )
 
-    if hist_adjust_active:
-        st.caption("Historical step adjustments are applied to oil rate before fitting.")
-    if len(active_forecast_uplifts) > 0:
-        st.caption(
-            f"{len(active_forecast_uplifts)} forecast uplift event(s) are included; each adds full rate at event date and then declines with the same trend as main forecast."
-        )
-
     if fit_window_mode == "Manual date range":
         st.caption(
             f"Manual fit range active: {pd.to_datetime(fit_start_1).date()} to {pd.to_datetime(fit_end_1).date()}"
@@ -1052,7 +882,6 @@ with tab2:
             fit_mask_2,
             forecast_years=forecast_years,
             forecast_start_rate=tab2_start_rate,
-            forecast_uplifts=forecast_uplifts if use_forecast_uplifts else None,
         )
         fit_error_2 = None
     except Exception as exc:
@@ -1111,13 +940,6 @@ with tab2:
         on_select=lambda: store_selection_from_widget("plot_tab2", "sel_q_np"),
         selection_mode=("points", "box", "lasso"),
     )
-
-    if hist_adjust_active:
-        st.caption("Historical step adjustments are applied to oil rate before fitting.")
-    if len(active_forecast_uplifts) > 0:
-        st.caption(
-            f"{len(active_forecast_uplifts)} forecast uplift event(s) are included; each adds full rate at event date and then declines with the same trend as main forecast."
-        )
 
     if fit_window_mode == "Manual date range":
         st.caption(
