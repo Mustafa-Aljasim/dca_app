@@ -182,6 +182,7 @@ def convert_df_to_csv(df):
 # =========================================================
 # Fit Engine
 # =========================================================
+
 def fit_decline(
     df,
     fit_mask,
@@ -205,7 +206,7 @@ def fit_decline(
     qi0 = float(np.nanmax(y_fit[valid]))
     Di0 = 0.5
     b0 = 0.7
-    bounds = ([1e-8, 1e-6, 0.0], [1e9, 5.0, 2.0])
+    bounds = ([1e-8, 1e-6, 0.0], [1e9, 5.0, 1.0])
 
     popt, _ = curve_fit(
         arps_rate,
@@ -217,31 +218,37 @@ def fit_decline(
     )
 
     fitted_params = {"qi": float(popt[0]), "Di": float(popt[1]), "b": float(popt[2])}
-    used_params = dict(fitted_params)
 
     hist_actual_cum = running_cumulative(df["Date"], df["OIL"])
     forecast_start_date = df["Date"].iloc[-1]
-    t_forecast_start = float((forecast_start_date - t0).total_seconds() / YEAR_SECONDS)
     q_start = float(df["OIL"].iloc[-1]) if forecast_start_rate is None else float(forecast_start_rate)
     q_start = max(q_start, 1e-8)
 
-    Di = used_params["Di"]
-    b = used_params["b"]
-    if np.isclose(b, 0.0):
-        used_params["qi"] = q_start * np.exp(Di * t_forecast_start)
-    else:
-        used_params["qi"] = q_start * ((1.0 + b * Di * t_forecast_start) ** (1.0 / b))
+    # Plot the fitted model only from the fit-window start onward.
+    hist_model_df = df.loc[df["Date"] >= t0, ["Date", "CumOil"]].copy()
+    t_hist_model = (hist_model_df["Date"] - t0).dt.total_seconds().to_numpy() / YEAR_SECONDS
+    hist_model_rate = arps_rate(t_hist_model, **fitted_params)
+    hist_model_df["Model_Rate"] = hist_model_rate
 
-    t_hist = (df["Date"] - t0).dt.total_seconds().to_numpy() / YEAR_SECONDS
-    hist_model_rate = arps_rate(t_hist, **used_params)
+    # Forecast is re-anchored at the end of history using the user-selected start rate
+    # together with the stable-period Di and b.
+    def arps_forecast_from_rate(t_years, q_start_local, Di_local, b_local):
+        t = np.asarray(t_years, dtype=float)
+        q_start_local = max(float(q_start_local), 1e-8)
+        if np.isclose(b_local, 0.0):
+            return q_start_local * np.exp(-Di_local * t)
+        denom = np.maximum(1.0 + b_local * Di_local * t, 1e-12)
+        return q_start_local / np.power(denom, 1.0 / b_local)
 
     forecast_dates = pd.date_range(
         start=forecast_start_date,
         periods=int(forecast_years * 12) + 1,
         freq="MS",
     )[1:]
-    t_fore = (forecast_dates - t0).total_seconds() / YEAR_SECONDS
-    forecast_rate_base = arps_rate(t_fore, **used_params)
+    t_fore = np.arange(1, len(forecast_dates) + 1, dtype=float) / 12.0
+    forecast_rate_base = arps_forecast_from_rate(
+        t_fore, q_start, fitted_params["Di"], fitted_params["b"]
+    )
 
     forecast_plot_dates = pd.DatetimeIndex([forecast_start_date]).append(pd.DatetimeIndex(forecast_dates))
     forecast_plot_rate_base = np.concatenate(([q_start], forecast_rate_base))
@@ -270,16 +277,17 @@ def fit_decline(
     combined_rates = pd.concat([df["OIL"], pd.Series(forecast_rate)], ignore_index=True)
     combined_cum = running_cumulative(combined_dates, combined_rates)
 
-    forecast_cum = combined_cum[len(df) :]
+    forecast_cum = combined_cum[len(df):]
     forecast_plot_cum = np.concatenate(([hist_actual_cum[-1]], forecast_cum))
-    hist_model_cum = running_cumulative(df["Date"], hist_model_rate)
+    hist_model_cum = running_cumulative(hist_model_df["Date"], hist_model_rate)
+    hist_model_df["Model_Cum"] = hist_model_cum
 
     return {
         "fit_df": fit_df,
         "fit_start": fit_df["Date"].min(),
         "fit_end": fit_df["Date"].max(),
         "fitted_params": fitted_params,
-        "used_params": used_params,
+        "hist_model_df": hist_model_df,
         "hist_model_rate": hist_model_rate,
         "hist_model_cum": hist_model_cum,
         "hist_actual_cum": hist_actual_cum,
@@ -295,7 +303,6 @@ def fit_decline(
         "forecast_plot_rate": forecast_plot_rate,
         "forecast_plot_cum": forecast_plot_cum,
     }
-
 
 def cumulative_from_wor_line(wor, m_ln, c_ln):
     """Invert ln(WOR)=m*Np+c for cumulative oil Np."""
@@ -905,8 +912,8 @@ with tab1:
     if result_1 is not None:
         fig1.add_trace(
             go.Scatter(
-                x=df["Date"],
-                y=result_1["hist_model_rate"],
+                x=result_1["hist_model_df"]["Date"],
+                y=result_1["hist_model_df"]["Model_Rate"],
                 mode="lines",
                 name="Model Fit",
                 line={"color": "#0057B8", "width": 3},
@@ -1077,8 +1084,8 @@ with tab2:
     if result_2 is not None:
         fig2.add_trace(
             go.Scatter(
-                x=df["CumOil"],
-                y=result_2["hist_model_rate"],
+                x=result_2["hist_model_df"]["CumOil"],
+                y=result_2["hist_model_df"]["Model_Rate"],
                 mode="lines",
                 name="Model Fit",
                 line={"color": "#0057B8", "width": 3},
