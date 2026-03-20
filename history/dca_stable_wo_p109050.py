@@ -27,50 +27,6 @@ def arps_rate(t_years, qi, Di, b):
     return qi / (denom ** (1.0 / b))
 
 
-def arps_forecast_from_anchor(t_years, q_start, Di, b):
-    """Forecast from a new origin using starting rate q_start at t=0."""
-    t_years = np.asarray(t_years, dtype=float)
-    q_start = max(float(q_start), 1e-8)
-    Di = max(float(Di), 1e-12)
-    b = float(b)
-
-    if np.isclose(b, 0.0):
-        return q_start * np.exp(-Di * t_years)
-
-    denom = np.clip(1.0 + b * Di * t_years, 1e-12, np.inf)
-    return q_start / (denom ** (1.0 / b))
-
-
-def continuous_to_nominal_annual_decline(D_cont):
-    """Convert continuous annual decline constant to nominal annual percentage drop."""
-    D_cont = np.asarray(D_cont, dtype=float)
-    return 1.0 - np.exp(-D_cont)
-
-
-def build_prediction_cases(result, p10_multiplier=0.85, p90_multiplier=1.15):
-    """Build simple P10/P50/P90 cases by varying forecast decline around the base case."""
-    dates = pd.DatetimeIndex(result['forecast_plot_dates'])
-    q0 = float(result['forecast_start_rate'])
-    Di0 = max(float(result['forecast_start_D']), 1e-12)
-    b0 = float(result['forecast_start_b'])
-    t_fore = np.arange(0, len(dates), dtype=float) / 12.0
-
-    def case(mult):
-        Di_case = max(Di0 * float(mult), 1e-12)
-        rate = arps_forecast_from_anchor(t_fore, q0, Di_case, b0)
-        uplift = np.asarray(result.get('forecast_plot_rate_uplift', np.zeros_like(rate)), dtype=float)
-        if len(uplift) == len(rate):
-            rate = rate + uplift
-        return {'multiplier': float(mult), 'Di': float(Di_case), 'rate': rate}
-
-    cases = {
-        'P10': case(p10_multiplier),
-        'P50': case(1.0),
-        'P90': case(p90_multiplier),
-    }
-    return {'dates': dates, 'cases': cases}
-
-
 def running_cumulative(dates, rates):
     """Running cumulative aligned with dates using trapezoids."""
     if len(dates) < 2:
@@ -328,6 +284,14 @@ def fit_decline(
         b_forecast = fitted_params["b"]
         anchor_note = "Forecast is re-anchored to the selected start rate using fitted Di and b from stable period."
 
+    def arps_forecast_from_anchor(t_years, q_anchor, D_anchor, b_anchor):
+        t = np.asarray(t_years, dtype=float)
+        q_anchor = max(float(q_anchor), 1e-8)
+        if np.isclose(b_anchor, 0.0):
+            return q_anchor * np.exp(-D_anchor * t)
+        denom = np.maximum(1.0 + b_anchor * D_anchor * t, 1e-12)
+        return q_anchor / np.power(denom, 1.0 / b_anchor)
+
     forecast_dates = pd.date_range(
         start=forecast_start_date,
         periods=int(forecast_years * 12) + 1,
@@ -372,7 +336,6 @@ def fit_decline(
         "fit_start": fit_df["Date"].min(),
         "fit_end": fit_df["Date"].max(),
         "fitted_params": fitted_params,
-        "fitted_nominal_annual_decline": float(continuous_to_nominal_annual_decline(fitted_params["Di"])),
         "decline_model": decline_model,
         "forecast_anchor_mode": forecast_anchor_mode,
         "hist_model_df": hist_model_df,
@@ -385,7 +348,6 @@ def fit_decline(
         "forecast_anchor_D_model": D_anchor_model,
         "forecast_start_D": D_forecast_start,
         "forecast_start_b": b_forecast,
-        "forecast_start_nominal_annual_decline": float(continuous_to_nominal_annual_decline(D_forecast_start)),
         "forecast_anchor_note": anchor_note,
         "forecast_dates": forecast_dates,
         "forecast_rate_base": forecast_rate_base,
@@ -926,45 +888,9 @@ forecast_anchor_mode_choice = st.sidebar.selectbox(
     ),
 )
 
-st.sidebar.caption("All calculations are internally converted to years.")
-
-show_prediction_cases = st.sidebar.checkbox(
-    "Show P10 / P50 / P90 prediction cases",
-    value=True,
-    help="Creates simple forecast sensitivity cases by varying decline rate around the base forecast.",
-)
-show_prediction_band = st.sidebar.checkbox(
-    "Shade P10-P90 band",
-    value=True,
-    help="Displays the uncertainty envelope between P10 and P90 on forecast plots.",
-)
-p10_decline_multiplier = st.sidebar.number_input(
-    "P10 decline multiplier",
-    min_value=0.10,
-    max_value=2.00,
-    value=0.85,
-    step=0.05,
-    format="%.2f",
-    help="P10 is optimistic by default, so it usually uses lower decline than the base case.",
-)
-p90_decline_multiplier = st.sidebar.number_input(
-    "P90 decline multiplier",
-    min_value=0.10,
-    max_value=3.00,
-    value=1.15,
-    step=0.05,
-    format="%.2f",
-    help="P90 is conservative by default, so it usually uses higher decline than the base case.",
-)
-
 for key in ("sel_time", "sel_q_np", "sel_wor_np", "sel_wor_qo"):
     if key not in st.session_state:
         st.session_state[key] = []
-for key in ("run_pcases_tab1", "run_pcases_tab2"):
-    if key not in st.session_state:
-        st.session_state[key] = False
-
-st.caption("All calculations are internally converted to years.")
 
 tab1, tab2, tab3, tab4 = st.tabs(
     [
@@ -979,14 +905,11 @@ tab1, tab2, tab3, tab4 = st.tabs(
 # Tab 1: Oil Rate vs Time + Optional Well Count
 # =========================================================
 with tab1:
-    left, center, right = st.columns([1, 1, 4])
+    left, right = st.columns([1, 5])
     with left:
         if st.button("Clear selection", key="clear_tab1"):
             st.session_state["sel_time"] = []
             st.rerun()
-    with center:
-        if st.button("Run Simulation", key="run_sim_tab1"):
-            st.session_state["run_pcases_tab1"] = True
     with right:
         tab1_start_rate = st.number_input(
             "First forecast point rate (at last historical date)",
@@ -1016,17 +939,9 @@ with tab1:
             decline_model=decline_model_choice,
             forecast_anchor_mode=forecast_anchor_mode_choice,
         )
-        prediction_cases_1 = None
-        if show_prediction_cases and st.session_state.get("run_pcases_tab1", False):
-            prediction_cases_1 = build_prediction_cases(
-                result_1,
-                p10_multiplier=p10_decline_multiplier,
-                p90_multiplier=p90_decline_multiplier,
-            )
         fit_error_1 = None
     except Exception as exc:
         result_1 = None
-        prediction_cases_1 = None
         fit_error_1 = str(exc)
 
     rows = 2 if well_df is not None else 1
@@ -1096,59 +1011,6 @@ with tab1:
             col=1,
         )
 
-        if show_prediction_cases and prediction_cases_1 is not None:
-            if show_prediction_band:
-                fig1.add_trace(
-                    go.Scatter(
-                        x=prediction_cases_1["dates"],
-                        y=prediction_cases_1["cases"]["P90"]["rate"],
-                        mode="lines",
-                        line={"width": 0},
-                        hoverinfo="skip",
-                        showlegend=False,
-                        name="P10-P90 band upper",
-                        fill=None,
-                    ),
-                    row=1,
-                    col=1,
-                )
-                fig1.add_trace(
-                    go.Scatter(
-                        x=prediction_cases_1["dates"],
-                        y=prediction_cases_1["cases"]["P10"]["rate"],
-                        mode="lines",
-                        line={"width": 0},
-                        fill="tonexty",
-                        fillcolor="rgba(214, 39, 40, 0.12)",
-                        name="P10-P90 band",
-                        hoverinfo="skip",
-                    ),
-                    row=1,
-                    col=1,
-                )
-            fig1.add_trace(
-                go.Scatter(
-                    x=prediction_cases_1["dates"],
-                    y=prediction_cases_1["cases"]["P10"]["rate"],
-                    mode="lines",
-                    name="P10",
-                    line={"color": "#2CA02C", "dash": "dot", "width": 2},
-                ),
-                row=1,
-                col=1,
-            )
-            fig1.add_trace(
-                go.Scatter(
-                    x=prediction_cases_1["dates"],
-                    y=prediction_cases_1["cases"]["P90"]["rate"],
-                    mode="lines",
-                    name="P90",
-                    line={"color": "#9467BD", "dash": "dot", "width": 2},
-                ),
-                row=1,
-                col=1,
-            )
-
     if fit_start_1 is not None and fit_end_1 is not None:
         fig1.add_vrect(
             x0=fit_start_1,
@@ -1211,9 +1073,6 @@ with tab1:
             f"Manual fit range active: {pd.to_datetime(fit_start_1).date()} to {pd.to_datetime(fit_end_1).date()}"
         )
 
-    if show_prediction_cases and not st.session_state.get("run_pcases_tab1", False):
-        st.info("Click Run Simulation to generate P10 / P50 / P90 forecast cases.")
-
     if fit_error_1:
         st.error(f"Fit error: {fit_error_1}")
     else:
@@ -1222,32 +1081,19 @@ with tab1:
             f"({len(result_1['fit_df'])} points)"
         )
 
-        c1, c2, c3, c4 = st.columns(4)
+        c1, c2, c3 = st.columns(3)
         c1.metric("qi", f"{result_1['fitted_params']['qi']:.2f}")
-        c2.metric("Di (1/year)", f"{result_1['fitted_params']['Di']:.4f}")
-        c3.metric("Nominal annual decline", f"{100.0 * result_1['fitted_nominal_annual_decline']:.2f}%")
-        c4.metric("b", f"{result_1['fitted_params']['b']:.3f}")
+        c2.metric("Di", f"{result_1['fitted_params']['Di']:.4f}")
+        c3.metric("b", f"{result_1['fitted_params']['b']:.3f}")
         st.caption(f"Model: {result_1['decline_model']} | Forecast mode: {result_1['forecast_anchor_mode']}")
         if result_1['forecast_anchor_mode'] == 'Rigorous parameter preservation':
             st.caption(
-                f"Forecast starts from model-preserved anchor at last history date: q={result_1['forecast_start_rate']:.2f}, D={result_1['forecast_start_D']:.4f}, nominal={100.0 * result_1['forecast_start_nominal_annual_decline']:.2f}%, b={result_1['forecast_start_b']:.3f}."
+                f"Forecast starts from model-preserved anchor at last history date: q={result_1['forecast_start_rate']:.2f}, D={result_1['forecast_start_D']:.4f}, b={result_1['forecast_start_b']:.3f}."
             )
         else:
             st.caption(
-                f"Forecast starts from selected rate anchor: q={result_1['forecast_start_rate']:.2f}, D={result_1['forecast_start_D']:.4f}, nominal={100.0 * result_1['forecast_start_nominal_annual_decline']:.2f}%, b={result_1['forecast_start_b']:.3f}."
+                f"Forecast starts from selected rate anchor: q={result_1['forecast_start_rate']:.2f}, D={result_1['forecast_start_D']:.4f}, b={result_1['forecast_start_b']:.3f}."
             )
-
-        if show_prediction_cases and prediction_cases_1 is not None:
-            case_rows_1 = []
-            for case_name in ("P10", "P50", "P90"):
-                rate_series = prediction_cases_1["cases"][case_name]["rate"]
-                case_rows_1.append({
-                    "Case": case_name,
-                    "Decline multiplier": prediction_cases_1["cases"][case_name]["multiplier"],
-                    "Start rate": float(rate_series[0]),
-                    "End rate": float(rate_series[-1]),
-                })
-            st.dataframe(pd.DataFrame(case_rows_1), use_container_width=True, hide_index=True)
 
         st.plotly_chart(
             cumulative_time_figure(
@@ -1272,14 +1118,11 @@ with tab1:
 # Tab 2: Cum Oil vs Oil Rate
 # =========================================================
 with tab2:
-    left, center, right = st.columns([1, 1, 4])
+    left, right = st.columns([1, 5])
     with left:
         if st.button("Clear selection", key="clear_tab2"):
             st.session_state["sel_q_np"] = []
             st.rerun()
-    with center:
-        if st.button("Run Simulation", key="run_sim_tab2"):
-            st.session_state["run_pcases_tab2"] = True
     with right:
         tab2_start_rate = st.number_input(
             "First forecast point rate (at last historical date)",
@@ -1309,17 +1152,9 @@ with tab2:
             decline_model=decline_model_choice,
             forecast_anchor_mode=forecast_anchor_mode_choice,
         )
-        prediction_cases_2 = None
-        if show_prediction_cases and st.session_state.get("run_pcases_tab2", False):
-            prediction_cases_2 = build_prediction_cases(
-                result_2,
-                p10_multiplier=p10_decline_multiplier,
-                p90_multiplier=p90_decline_multiplier,
-            )
         fit_error_2 = None
     except Exception as exc:
         result_2 = None
-        prediction_cases_2 = None
         fit_error_2 = str(exc)
 
     marker_colors = np.where(fit_mask_2, "#1f77b4", "#B0B0B0")
@@ -1357,58 +1192,6 @@ with tab2:
             )
         )
 
-        if show_prediction_cases and prediction_cases_2 is not None:
-            case_cums_2 = {}
-            for case_name in ("P10", "P50", "P90"):
-                case_rates = prediction_cases_2["cases"][case_name]["rate"][1:]
-                comb_dates = pd.concat([df["Date"], pd.Series(prediction_cases_2["dates"][1:])], ignore_index=True)
-                comb_rates = pd.concat([df["OIL"], pd.Series(case_rates)], ignore_index=True)
-                comb_cum = running_cumulative(comb_dates, comb_rates)
-                case_cums_2[case_name] = np.concatenate(([result_2["hist_actual_cum"][-1]], comb_cum[len(df):]))
-            if show_prediction_band:
-                fig2.add_trace(
-                    go.Scatter(
-                        x=case_cums_2["P90"],
-                        y=prediction_cases_2["cases"]["P90"]["rate"],
-                        mode="lines",
-                        line={"width": 0},
-                        hoverinfo="skip",
-                        showlegend=False,
-                        name="P10-P90 band upper",
-                        fill=None,
-                    )
-                )
-                fig2.add_trace(
-                    go.Scatter(
-                        x=case_cums_2["P10"],
-                        y=prediction_cases_2["cases"]["P10"]["rate"],
-                        mode="lines",
-                        line={"width": 0},
-                        fill="tonexty",
-                        fillcolor="rgba(214, 39, 40, 0.12)",
-                        name="P10-P90 band",
-                        hoverinfo="skip",
-                    )
-                )
-            fig2.add_trace(
-                go.Scatter(
-                    x=case_cums_2["P10"],
-                    y=prediction_cases_2["cases"]["P10"]["rate"],
-                    mode="lines",
-                    name="P10",
-                    line={"color": "#2CA02C", "dash": "dot", "width": 2},
-                )
-            )
-            fig2.add_trace(
-                go.Scatter(
-                    x=case_cums_2["P90"],
-                    y=prediction_cases_2["cases"]["P90"]["rate"],
-                    mode="lines",
-                    name="P90",
-                    line={"color": "#9467BD", "dash": "dot", "width": 2},
-                )
-            )
-
     fig2.update_layout(
         title="Cumulative Oil vs Oil Rate (select points for fit window)",
         height=600,
@@ -1439,9 +1222,6 @@ with tab2:
             f"Manual fit range active: {pd.to_datetime(fit_start_2).date()} to {pd.to_datetime(fit_end_2).date()}"
         )
 
-    if show_prediction_cases and not st.session_state.get("run_pcases_tab2", False):
-        st.info("Click Run Simulation to generate P10 / P50 / P90 forecast cases.")
-
     if fit_error_2:
         st.error(f"Fit error: {fit_error_2}")
     else:
@@ -1450,32 +1230,19 @@ with tab2:
             f"({len(result_2['fit_df'])} points)"
         )
 
-        c1, c2, c3, c4 = st.columns(4)
+        c1, c2, c3 = st.columns(3)
         c1.metric("qi", f"{result_2['fitted_params']['qi']:.2f}")
-        c2.metric("Di (1/year)", f"{result_2['fitted_params']['Di']:.4f}")
-        c3.metric("Nominal annual decline", f"{100.0 * result_2['fitted_nominal_annual_decline']:.2f}%")
-        c4.metric("b", f"{result_2['fitted_params']['b']:.3f}")
+        c2.metric("Di", f"{result_2['fitted_params']['Di']:.4f}")
+        c3.metric("b", f"{result_2['fitted_params']['b']:.3f}")
         st.caption(f"Model: {result_2['decline_model']} | Forecast mode: {result_2['forecast_anchor_mode']}")
         if result_2['forecast_anchor_mode'] == 'Rigorous parameter preservation':
             st.caption(
-                f"Forecast starts from model-preserved anchor at last history date: q={result_2['forecast_start_rate']:.2f}, D={result_2['forecast_start_D']:.4f}, nominal={100.0 * result_2['forecast_start_nominal_annual_decline']:.2f}%, b={result_2['forecast_start_b']:.3f}."
+                f"Forecast starts from model-preserved anchor at last history date: q={result_2['forecast_start_rate']:.2f}, D={result_2['forecast_start_D']:.4f}, b={result_2['forecast_start_b']:.3f}."
             )
         else:
             st.caption(
-                f"Forecast starts from selected rate anchor: q={result_2['forecast_start_rate']:.2f}, D={result_2['forecast_start_D']:.4f}, nominal={100.0 * result_2['forecast_start_nominal_annual_decline']:.2f}%, b={result_2['forecast_start_b']:.3f}."
+                f"Forecast starts from selected rate anchor: q={result_2['forecast_start_rate']:.2f}, D={result_2['forecast_start_D']:.4f}, b={result_2['forecast_start_b']:.3f}."
             )
-
-        if show_prediction_cases and prediction_cases_2 is not None:
-            case_rows_2 = []
-            for case_name in ("P10", "P50", "P90"):
-                rate_series = prediction_cases_2["cases"][case_name]["rate"]
-                case_rows_2.append({
-                    "Case": case_name,
-                    "Decline multiplier": prediction_cases_2["cases"][case_name]["multiplier"],
-                    "Start rate": float(rate_series[0]),
-                    "End rate": float(rate_series[-1]),
-                })
-            st.dataframe(pd.DataFrame(case_rows_2), use_container_width=True, hide_index=True)
 
         st.plotly_chart(
             cumulative_time_figure(
