@@ -41,10 +41,16 @@ def arps_forecast_from_anchor(t_years, q_start, Di, b):
     return q_start / (denom ** (1.0 / b))
 
 
-def continuous_to_nominal_annual_decline(D_cont):
-    """Convert continuous annual decline constant to nominal annual percentage drop."""
-    D_cont = np.asarray(D_cont, dtype=float)
-    return 1.0 - np.exp(-D_cont)
+def arps_to_effective_annual_decline(Di, b):
+    """Convert Arps decline parameters to model-consistent effective annual percentage drop."""
+    Di = np.asarray(Di, dtype=float)
+    b = np.asarray(b, dtype=float)
+
+    exp_case = 1.0 - np.exp(-Di)
+    safe_b = np.where(np.isclose(b, 0.0), 1.0, b)
+    denom = np.clip(1.0 + b * Di, 1e-12, np.inf)
+    hyperbolic_case = 1.0 - np.power(denom, -1.0 / safe_b)
+    return np.where(np.isclose(b, 0.0), exp_case, hyperbolic_case)
 
 
 def build_prediction_cases(result, p10_multiplier=0.85, p90_multiplier=1.15):
@@ -372,7 +378,7 @@ def fit_decline(
         "fit_start": fit_df["Date"].min(),
         "fit_end": fit_df["Date"].max(),
         "fitted_params": fitted_params,
-        "fitted_nominal_annual_decline": float(continuous_to_nominal_annual_decline(fitted_params["Di"])),
+        "fitted_effective_annual_decline": float(arps_to_effective_annual_decline(fitted_params["Di"], fitted_params["b"])),
         "decline_model": decline_model,
         "forecast_anchor_mode": forecast_anchor_mode,
         "hist_model_df": hist_model_df,
@@ -385,7 +391,7 @@ def fit_decline(
         "forecast_anchor_D_model": D_anchor_model,
         "forecast_start_D": D_forecast_start,
         "forecast_start_b": b_forecast,
-        "forecast_start_nominal_annual_decline": float(continuous_to_nominal_annual_decline(D_forecast_start)),
+        "forecast_start_effective_annual_decline": float(arps_to_effective_annual_decline(D_forecast_start, b_forecast)),
         "forecast_anchor_note": anchor_note,
         "forecast_dates": forecast_dates,
         "forecast_rate_base": forecast_rate_base,
@@ -1225,16 +1231,16 @@ with tab1:
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("qi", f"{result_1['fitted_params']['qi']:.2f}")
         c2.metric("Di (1/year)", f"{result_1['fitted_params']['Di']:.4f}")
-        c3.metric("Nominal annual decline", f"{100.0 * result_1['fitted_nominal_annual_decline']:.2f}%")
+        c3.metric("Effective annual decline", f"{100.0 * result_1['fitted_effective_annual_decline']:.2f}%")
         c4.metric("b", f"{result_1['fitted_params']['b']:.3f}")
         st.caption(f"Model: {result_1['decline_model']} | Forecast mode: {result_1['forecast_anchor_mode']}")
         if result_1['forecast_anchor_mode'] == 'Rigorous parameter preservation':
             st.caption(
-                f"Forecast starts from model-preserved anchor at last history date: q={result_1['forecast_start_rate']:.2f}, D={result_1['forecast_start_D']:.4f}, nominal={100.0 * result_1['forecast_start_nominal_annual_decline']:.2f}%, b={result_1['forecast_start_b']:.3f}."
+                f"Forecast starts from model-preserved anchor at last history date: q={result_1['forecast_start_rate']:.2f}, D={result_1['forecast_start_D']:.4f}, effective={100.0 * result_1['forecast_start_effective_annual_decline']:.2f}%, b={result_1['forecast_start_b']:.3f}."
             )
         else:
             st.caption(
-                f"Forecast starts from selected rate anchor: q={result_1['forecast_start_rate']:.2f}, D={result_1['forecast_start_D']:.4f}, nominal={100.0 * result_1['forecast_start_nominal_annual_decline']:.2f}%, b={result_1['forecast_start_b']:.3f}."
+                f"Forecast starts from selected rate anchor: q={result_1['forecast_start_rate']:.2f}, D={result_1['forecast_start_D']:.4f}, effective={100.0 * result_1['forecast_start_effective_annual_decline']:.2f}%, b={result_1['forecast_start_b']:.3f}."
             )
 
         if show_prediction_cases and prediction_cases_1 is not None:
@@ -1453,16 +1459,16 @@ with tab2:
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("qi", f"{result_2['fitted_params']['qi']:.2f}")
         c2.metric("Di (1/year)", f"{result_2['fitted_params']['Di']:.4f}")
-        c3.metric("Nominal annual decline", f"{100.0 * result_2['fitted_nominal_annual_decline']:.2f}%")
+        c3.metric("Effective annual decline", f"{100.0 * result_2['fitted_effective_annual_decline']:.2f}%")
         c4.metric("b", f"{result_2['fitted_params']['b']:.3f}")
         st.caption(f"Model: {result_2['decline_model']} | Forecast mode: {result_2['forecast_anchor_mode']}")
         if result_2['forecast_anchor_mode'] == 'Rigorous parameter preservation':
             st.caption(
-                f"Forecast starts from model-preserved anchor at last history date: q={result_2['forecast_start_rate']:.2f}, D={result_2['forecast_start_D']:.4f}, nominal={100.0 * result_2['forecast_start_nominal_annual_decline']:.2f}%, b={result_2['forecast_start_b']:.3f}."
+                f"Forecast starts from model-preserved anchor at last history date: q={result_2['forecast_start_rate']:.2f}, D={result_2['forecast_start_D']:.4f}, effective={100.0 * result_2['forecast_start_effective_annual_decline']:.2f}%, b={result_2['forecast_start_b']:.3f}."
             )
         else:
             st.caption(
-                f"Forecast starts from selected rate anchor: q={result_2['forecast_start_rate']:.2f}, D={result_2['forecast_start_D']:.4f}, nominal={100.0 * result_2['forecast_start_nominal_annual_decline']:.2f}%, b={result_2['forecast_start_b']:.3f}."
+                f"Forecast starts from selected rate anchor: q={result_2['forecast_start_rate']:.2f}, D={result_2['forecast_start_D']:.4f}, effective={100.0 * result_2['forecast_start_effective_annual_decline']:.2f}%, b={result_2['forecast_start_b']:.3f}."
             )
 
         if show_prediction_cases and prediction_cases_2 is not None:
