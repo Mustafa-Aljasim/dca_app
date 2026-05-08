@@ -27,16 +27,65 @@ def arps_rate(t_years, qi, Di, b):
     return qi / (denom ** (1.0 / b))
 
 
+def arps_forecast_from_anchor(t_years, q_start, Di, b):
+    """Forecast from a new origin using starting rate q_start at t=0."""
+    t_years = np.asarray(t_years, dtype=float)
+    q_start = max(float(q_start), 1e-8)
+    Di = max(float(Di), 1e-12)
+    b = float(b)
+
+    if np.isclose(b, 0.0):
+        return q_start * np.exp(-Di * t_years)
+
+    denom = np.clip(1.0 + b * Di * t_years, 1e-12, np.inf)
+    return q_start / (denom ** (1.0 / b))
+
+
+def arps_to_effective_annual_decline(Di, b):
+    """Convert Arps decline parameters to model-consistent effective annual percentage drop."""
+    Di = np.asarray(Di, dtype=float)
+    b = np.asarray(b, dtype=float)
+
+    exp_case = 1.0 - np.exp(-Di)
+    safe_b = np.where(np.isclose(b, 0.0), 1.0, b)
+    denom = np.clip(1.0 + b * Di, 1e-12, np.inf)
+    hyperbolic_case = 1.0 - np.power(denom, -1.0 / safe_b)
+    return np.where(np.isclose(b, 0.0), exp_case, hyperbolic_case)
+
+
+def build_prediction_cases(result, p10_multiplier=0.85, p90_multiplier=1.15):
+    """Build simple P10/P50/P90 cases by varying forecast decline around the base case."""
+    dates = pd.DatetimeIndex(result['forecast_plot_dates'])
+    q0 = float(result['forecast_start_rate'])
+    Di0 = max(float(result['forecast_start_D']), 1e-12)
+    b0 = float(result['forecast_start_b'])
+    t_fore = np.arange(0, len(dates), dtype=float) / 12.0
+
+    def case(mult):
+        Di_case = max(Di0 * float(mult), 1e-12)
+        rate = arps_forecast_from_anchor(t_fore, q0, Di_case, b0)
+        uplift = np.asarray(result.get('forecast_plot_rate_uplift', np.zeros_like(rate)), dtype=float)
+        if len(uplift) == len(rate):
+            rate = rate + uplift
+        return {'multiplier': float(mult), 'Di': float(Di_case), 'rate': rate}
+
+    cases = {
+        'P10': case(p10_multiplier),
+        'P50': case(1.0),
+        'P90': case(p90_multiplier),
+    }
+    return {'dates': dates, 'cases': cases}
+
+
 def running_cumulative(dates, rates):
-    """Running cumulative aligned with dates using trapezoids."""
+    """Running cumulative using step-rate rectangles with the current sample rate."""
     if len(dates) < 2:
         return np.zeros(len(dates), dtype=float)
 
     d = pd.to_datetime(dates).to_numpy()
     r = np.asarray(rates, dtype=float)
     dt_days = np.diff(d).astype("timedelta64[s]").astype(float) / 86400.0
-    avg_rates = 0.5 * (r[1:] + r[:-1])
-    segment_areas = avg_rates * dt_days
+    segment_areas = r[1:] * dt_days
     return np.concatenate(([0.0], np.cumsum(segment_areas)))
 
 
@@ -49,6 +98,12 @@ def wor_from_watercut(watercut):
     watercut = np.asarray(watercut, dtype=float)
     denom = np.clip(1.0 - watercut, 1e-12, np.inf)
     return watercut / denom
+
+
+def wor_from_log1p(log_wor_plus1):
+    """Invert ln(WOR+1) and clamp to physical WOR >= 0."""
+    log_wor_plus1 = np.asarray(log_wor_plus1, dtype=float)
+    return np.expm1(np.clip(log_wor_plus1, 0.0, np.inf))
 
 
 # =========================================================
@@ -189,8 +244,10 @@ def fit_decline(
     forecast_years=10,
     forecast_start_rate=None,
     forecast_uplifts=None,
+    decline_model="Hyperbolic",
+    forecast_anchor_mode="Practical re-anchored",
 ):
-    """Fit Arps on selected history and forecast from end of full history."""
+    """Fit selected Arps model on chosen history and forecast from end of full history."""
     fit_df = df.loc[fit_mask].copy().sort_values("Date")
     if fit_df.empty or len(fit_df) < 5:
         raise ValueError("Select at least 5 points for fitting.")
@@ -203,42 +260,84 @@ def fit_decline(
     if valid.sum() < 5:
         raise ValueError("Not enough positive data points in selected fit window.")
 
+    model_key = str(decline_model).strip().lower()
+
+    def arps_model_selected(t_years, qi, Di, b_free):
+        if model_key == "exponential":
+            return arps_rate(t_years, qi, Di, 0.0)
+        if model_key == "harmonic":
+            return arps_rate(t_years, qi, Di, 1.0)
+        return arps_rate(t_years, qi, Di, b_free)
+
     qi0 = float(np.nanmax(y_fit[valid]))
     Di0 = 0.5
-    b0 = 0.7
-    bounds = ([1e-8, 1e-6, 0.0], [1e9, 5.0, 1.0])
 
-    popt, _ = curve_fit(
-        arps_rate,
-        t_fit[valid],
-        y_fit[valid],
-        p0=[qi0, Di0, b0],
-        bounds=bounds,
-        maxfev=30000,
-    )
-
-    fitted_params = {"qi": float(popt[0]), "Di": float(popt[1]), "b": float(popt[2])}
+    if model_key == "exponential":
+        popt, _ = curve_fit(
+            lambda t, qi, Di: arps_rate(t, qi, Di, 0.0),
+            t_fit[valid],
+            y_fit[valid],
+            p0=[qi0, Di0],
+            bounds=([1e-8, 1e-6], [1e9, 5.0]),
+            maxfev=30000,
+        )
+        fitted_params = {"qi": float(popt[0]), "Di": float(popt[1]), "b": 0.0}
+    elif model_key == "harmonic":
+        popt, _ = curve_fit(
+            lambda t, qi, Di: arps_rate(t, qi, Di, 1.0),
+            t_fit[valid],
+            y_fit[valid],
+            p0=[qi0, Di0],
+            bounds=([1e-8, 1e-6], [1e9, 5.0]),
+            maxfev=30000,
+        )
+        fitted_params = {"qi": float(popt[0]), "Di": float(popt[1]), "b": 1.0}
+    else:
+        b0 = 0.7
+        popt, _ = curve_fit(
+            arps_rate,
+            t_fit[valid],
+            y_fit[valid],
+            p0=[qi0, Di0, b0],
+            bounds=([1e-8, 1e-6, 0.0], [1e9, 5.0, 1.0]),
+            maxfev=30000,
+        )
+        fitted_params = {"qi": float(popt[0]), "Di": float(popt[1]), "b": float(popt[2])}
 
     hist_actual_cum = running_cumulative(df["Date"], df["OIL"])
     forecast_start_date = df["Date"].iloc[-1]
-    q_start = float(df["OIL"].iloc[-1]) if forecast_start_rate is None else float(forecast_start_rate)
-    q_start = max(q_start, 1e-8)
+    q_start_user = float(df["OIL"].iloc[-1]) if forecast_start_rate is None else float(forecast_start_rate)
+    q_start_user = max(q_start_user, 1e-8)
 
-    # Plot the fitted model only from the fit-window start onward.
+    # Plot fitted model only from fit-window start onward.
     hist_model_df = df.loc[df["Date"] >= t0, ["Date", "CumOil"]].copy()
     t_hist_model = (hist_model_df["Date"] - t0).dt.total_seconds().to_numpy() / YEAR_SECONDS
     hist_model_rate = arps_rate(t_hist_model, **fitted_params)
     hist_model_df["Model_Rate"] = hist_model_rate
 
-    # Forecast is re-anchored at the end of history using the user-selected start rate
-    # together with the stable-period Di and b.
-    def arps_forecast_from_rate(t_years, q_start_local, Di_local, b_local):
-        t = np.asarray(t_years, dtype=float)
-        q_start_local = max(float(q_start_local), 1e-8)
-        if np.isclose(b_local, 0.0):
-            return q_start_local * np.exp(-Di_local * t)
-        denom = np.maximum(1.0 + b_local * Di_local * t, 1e-12)
-        return q_start_local / np.power(denom, 1.0 / b_local)
+    # Forecast anchor options
+    # 1) Practical re-anchored: use last/manual rate with fitted Di and b
+    # 2) Rigorous parameter preservation: preserve fitted model, move to forecast origin
+    anchor_mode_key = str(forecast_anchor_mode).strip().lower()
+    t_anchor = float((forecast_start_date - t0).total_seconds() / YEAR_SECONDS)
+    q_anchor_model = float(arps_rate(np.array([t_anchor]), **fitted_params)[0])
+    q_anchor_model = max(q_anchor_model, 1e-8)
+
+    if np.isclose(fitted_params["b"], 0.0):
+        D_anchor_model = fitted_params["Di"]
+    else:
+        D_anchor_model = fitted_params["Di"] / max(1.0 + fitted_params["b"] * fitted_params["Di"] * t_anchor, 1e-12)
+
+    if anchor_mode_key == "rigorous parameter preservation":
+        q_forecast_start = q_anchor_model
+        D_forecast_start = D_anchor_model
+        b_forecast = fitted_params["b"]
+        anchor_note = "Forecast preserves fitted Arps model at forecast start; manual start rate is ignored."
+    else:
+        q_forecast_start = q_start_user
+        D_forecast_start = fitted_params["Di"]
+        b_forecast = fitted_params["b"]
+        anchor_note = "Forecast is re-anchored to the selected start rate using fitted Di and b from stable period."
 
     forecast_dates = pd.date_range(
         start=forecast_start_date,
@@ -246,16 +345,13 @@ def fit_decline(
         freq="MS",
     )[1:]
     t_fore = np.arange(1, len(forecast_dates) + 1, dtype=float) / 12.0
-    forecast_rate_base = arps_forecast_from_rate(
-        t_fore, q_start, fitted_params["Di"], fitted_params["b"]
+    forecast_rate_base = arps_forecast_from_anchor(
+        t_fore, q_forecast_start, D_forecast_start, b_forecast
     )
 
     forecast_plot_dates = pd.DatetimeIndex([forecast_start_date]).append(pd.DatetimeIndex(forecast_dates))
-    forecast_plot_rate_base = np.concatenate(([q_start], forecast_rate_base))
+    forecast_plot_rate_base = np.concatenate(([q_forecast_start], forecast_rate_base))
 
-    # Optional uplift activities:
-    # Add full event rate at its date, then carry that added component forward
-    # with the same decline trend as the main forecast.
     uplift_plot_rate = np.zeros(len(forecast_plot_dates), dtype=float)
     if forecast_uplifts:
         plot_dates = pd.to_datetime(pd.Series(forecast_plot_dates)).to_numpy(dtype="datetime64[ns]")
@@ -287,11 +383,21 @@ def fit_decline(
         "fit_start": fit_df["Date"].min(),
         "fit_end": fit_df["Date"].max(),
         "fitted_params": fitted_params,
+        "fitted_effective_annual_decline": float(arps_to_effective_annual_decline(fitted_params["Di"], fitted_params["b"])),
+        "decline_model": decline_model,
+        "forecast_anchor_mode": forecast_anchor_mode,
         "hist_model_df": hist_model_df,
         "hist_model_rate": hist_model_rate,
         "hist_model_cum": hist_model_cum,
         "hist_actual_cum": hist_actual_cum,
-        "forecast_start_rate": q_start,
+        "forecast_start_rate_input": q_start_user,
+        "forecast_start_rate": q_forecast_start,
+        "forecast_anchor_rate_model": q_anchor_model,
+        "forecast_anchor_D_model": D_anchor_model,
+        "forecast_start_D": D_forecast_start,
+        "forecast_start_b": b_forecast,
+        "forecast_start_effective_annual_decline": float(arps_to_effective_annual_decline(D_forecast_start, b_forecast)),
+        "forecast_anchor_note": anchor_note,
         "forecast_dates": forecast_dates,
         "forecast_rate_base": forecast_rate_base,
         "forecast_rate_uplift": uplift_plot_rate[1:],
@@ -304,27 +410,56 @@ def fit_decline(
         "forecast_plot_cum": forecast_plot_cum,
     }
 
-def cumulative_from_wor_line(wor, m_ln, c_ln):
-    """Invert ln(WOR)=m*Np+c for cumulative oil Np."""
+def cumulative_from_wor_line(wor, m_log1p, c_log1p):
+    """Invert ln(WOR+1)=m*Np+c for cumulative oil Np."""
     wor = np.asarray(wor, dtype=float)
-    if np.any(wor <= 0):
-        raise ValueError("WOR must stay positive for logarithmic inversion.")
-    m_ln = float(m_ln)
-    c_ln = float(c_ln)
-    if np.isclose(m_ln, 0.0):
-        raise ValueError("WOR-vs-cumulative fit slope is near zero; cannot invert to cumulative oil.")
-    return (np.log(wor) - c_ln) / m_ln
+    if np.any(wor < 0):
+        raise ValueError("WOR must stay non-negative for ln(WOR+1) inversion.")
+    m_log1p = float(m_log1p)
+    c_log1p = float(c_log1p)
+    if np.isclose(m_log1p, 0.0):
+        raise ValueError("ln(WOR+1)-vs-cumulative fit slope is near zero; cannot invert to cumulative oil.")
+    return (np.log1p(wor) - c_log1p) / m_log1p
+
+
+def oil_forecast_frame_from_result(result, source_label, forecast_end_date=None):
+    """Build forecast frame from a saved oil-rate result."""
+    forecast_df = pd.DataFrame(
+        {
+            "Date": pd.to_datetime(pd.Series(result["forecast_dates"])),
+            "Source_Forecast_OilRate": np.asarray(result["forecast_rate"], dtype=float),
+            "Forecast_Cumulative_Oil": np.asarray(result["forecast_cum"], dtype=float),
+        }
+    ).sort_values("Date").reset_index(drop=True)
+
+    if forecast_df.empty:
+        raise ValueError("Selected oil-rate forecast has no forecast rows.")
+
+    if forecast_end_date is not None:
+        forecast_end_date = pd.to_datetime(forecast_end_date)
+        max_source_date = pd.to_datetime(forecast_df["Date"].max())
+        if forecast_end_date > max_source_date:
+            raise ValueError(
+                "Selected oil-rate forecast ends at "
+                f"{max_source_date.date()}. Extend the Tab 1/Tab 2 oil forecast first."
+            )
+        forecast_df = forecast_df.loc[forecast_df["Date"] <= forecast_end_date].copy()
+        if forecast_df.empty:
+            raise ValueError("No saved oil-forecast rows remain up to the requested WOR end date.")
+
+    forecast_df["Oil_Forecast_Source"] = source_label
+    return forecast_df
 
 
 def fit_wor_vs_cum_line(df, fit_mask):
-    """Fit straight line on plotted space: ln(WOR)=m*Np+c."""
-    valid_mask = fit_mask & np.isfinite(df["CumOil"]) & np.isfinite(df["lnWOR"])
-    fit_df = df.loc[valid_mask, ["Date", "CumOil", "WOR", "lnWOR"]].copy().sort_values("Date")
+    """Fit straight line on plotted space: ln(WOR+1)=m*Np+c."""
+    valid_mask = fit_mask & np.isfinite(df["CumOil"]) & np.isfinite(df["lnWORp1"])
+    fit_df = df.loc[valid_mask, ["Date", "CumOil", "WOR", "lnWORp1"]].copy().sort_values("Date")
     if fit_df.empty or len(fit_df) < 5:
         raise ValueError("Select at least 5 valid WOR points for fitting.")
 
     x = fit_df["CumOil"].astype(float).to_numpy()
-    y = fit_df["lnWOR"].astype(float).to_numpy()
+    y = fit_df["lnWORp1"].astype(float).to_numpy()
     if np.allclose(x, x[0]):
         raise ValueError("Selected cumulative-oil points are identical; cannot fit a straight line.")
 
@@ -338,22 +473,22 @@ def fit_wor_vs_cum_line(df, fit_mask):
         "fit_df": fit_df,
         "fit_start": fit_df["Date"].min(),
         "fit_end": fit_df["Date"].max(),
-        "m_ln": float(m),
-        "c_ln": float(c),
-        "r2_log": r2,
+        "m_log1p": float(m),
+        "c_log1p": float(c),
+        "r2_log1p": r2,
     }
 
 
 def fit_wor_vs_time_line(df, fit_mask):
-    """Fit straight line for time trend: ln(WOR)=m*t_years+c."""
-    valid_mask = fit_mask & np.isfinite(df["lnWOR"])
-    fit_df = df.loc[valid_mask, ["Date", "WOR", "lnWOR"]].copy().sort_values("Date")
+    """Fit straight line for time trend: ln(WOR+1)=m*t_years+c."""
+    valid_mask = fit_mask & np.isfinite(df["lnWORp1"])
+    fit_df = df.loc[valid_mask, ["Date", "WOR", "lnWORp1"]].copy().sort_values("Date")
     if fit_df.empty or len(fit_df) < 5:
         raise ValueError("Select at least 5 valid WOR points for time forecasting.")
 
     t0 = fit_df["Date"].iloc[0]
     x = (fit_df["Date"] - t0).dt.total_seconds().to_numpy() / YEAR_SECONDS
-    y = fit_df["lnWOR"].astype(float).to_numpy()
+    y = fit_df["lnWORp1"].astype(float).to_numpy()
     if np.allclose(x, x[0]):
         raise ValueError("Selected dates are identical; cannot fit WOR time trend.")
 
@@ -368,9 +503,9 @@ def fit_wor_vs_time_line(df, fit_mask):
         "fit_start": fit_df["Date"].min(),
         "fit_end": fit_df["Date"].max(),
         "t0": t0,
-        "m_ln_time": float(m),
-        "c_ln_time": float(c),
-        "r2_log": r2,
+        "m_log1p_time": float(m),
+        "c_log1p_time": float(c),
+        "r2_log1p": r2,
     }
 
 
@@ -378,10 +513,10 @@ def forecast_wor_at_date(target_date, fit_np, fit_time):
     """Forecast WOR/WC/CumOil at a specific date using straight-line equations."""
     target_date = pd.to_datetime(target_date)
     t_target = float((target_date - fit_time["t0"]).total_seconds() / YEAR_SECONDS)
-    lnwor_target = fit_time["m_ln_time"] * t_target + fit_time["c_ln_time"]
-    target_wor = float(np.clip(np.exp(lnwor_target), 1e-12, np.inf))
+    logwor1p_target = max(fit_time["m_log1p_time"] * t_target + fit_time["c_log1p_time"], 0.0)
+    target_wor = float(wor_from_log1p(logwor1p_target))
     target_wc = float(watercut_from_wor(target_wor))
-    target_cum = float(cumulative_from_wor_line(target_wor, fit_np["m_ln"], fit_np["c_ln"]))
+    target_cum = float(cumulative_from_wor_line(target_wor, fit_np["m_log1p"], fit_np["c_log1p"]))
     return {
         "Date": target_date,
         "Forecast_WOR": target_wor,
@@ -409,9 +544,9 @@ def build_wor_forecast(df, fit_mask, forecast_end_date):
     forecast_dates = pd.DatetimeIndex(sorted(set(pd.to_datetime(forecast_dates))))
 
     t_fore = (forecast_dates - fit_time["t0"]).total_seconds() / YEAR_SECONDS
-    lnwor_fore = fit_time["m_ln_time"] * t_fore + fit_time["c_ln_time"]
-    forecast_wor = np.clip(np.exp(lnwor_fore), 1e-12, np.inf)
-    forecast_cum = cumulative_from_wor_line(forecast_wor, fit_np["m_ln"], fit_np["c_ln"])
+    logwor1p_fore = np.clip(fit_time["m_log1p_time"] * t_fore + fit_time["c_log1p_time"], 0.0, np.inf)
+    forecast_wor = wor_from_log1p(logwor1p_fore)
+    forecast_cum = cumulative_from_wor_line(forecast_wor, fit_np["m_log1p"], fit_np["c_log1p"])
     forecast_wc = watercut_from_wor(forecast_wor)
 
     forecast_df = pd.DataFrame(
@@ -430,6 +565,36 @@ def build_wor_forecast(df, fit_mask, forecast_end_date):
     return {
         "fit_np": fit_np,
         "fit_time": fit_time,
+        "forecast_df": forecast_df,
+        "end_report": end_report,
+    }
+
+
+def build_wor_forecast_from_source_path(df, fit_mask, source_result, source_label, forecast_end_date=None):
+    """Forecast WOR and water cut along a saved oil-forecast cumulative path."""
+    fit_np = fit_wor_vs_cum_line(df, fit_mask)
+    forecast_df = oil_forecast_frame_from_result(
+        source_result,
+        source_label=source_label,
+        forecast_end_date=forecast_end_date,
+    )
+    logwor1p_fore = fit_np["m_log1p"] * forecast_df["Forecast_Cumulative_Oil"].to_numpy() + fit_np["c_log1p"]
+    forecast_df["Forecast_lnWORp1"] = np.clip(logwor1p_fore, 0.0, np.inf)
+    forecast_df["Forecast_WOR"] = wor_from_log1p(forecast_df["Forecast_lnWORp1"])
+    forecast_df["Forecast_WaterCut"] = watercut_from_wor(forecast_df["Forecast_WOR"])
+
+    end_report = forecast_df.iloc[-1][
+        [
+            "Date",
+            "Oil_Forecast_Source",
+            "Source_Forecast_OilRate",
+            "Forecast_Cumulative_Oil",
+            "Forecast_WOR",
+            "Forecast_WaterCut",
+        ]
+    ].to_dict()
+    return {
+        "fit_np": fit_np,
         "forecast_df": forecast_df,
         "end_report": end_report,
     }
@@ -601,6 +766,29 @@ def forecast_download_frame(result):
     return out
 
 
+def historical_plot_table(plot_df):
+    out = plot_df[["Date", "OIL", "WATER", "WOR", "CumOil", "lnWORp1"]].copy()
+    out.insert(4, "1+WOR", 1.0 + out["WOR"])
+    return out.rename(
+        columns={
+            "CumOil": "Cum oil",
+            "lnWORp1": "ln(WOR+1)",
+        }
+    )
+
+
+def save_wor_source(source_label, result):
+    st.session_state["wor_source_label"] = source_label
+    st.session_state["wor_source_result"] = result
+
+
+def get_saved_wor_source():
+    return (
+        st.session_state.get("wor_source_label"),
+        st.session_state.get("wor_source_result"),
+    )
+
+
 def cumulative_time_figure(df, result, title):
     fig = go.Figure()
     fig.add_trace(
@@ -636,10 +824,11 @@ def cumulative_time_figure(df, result, title):
 # Streamlit App
 # =========================================================
 st.set_page_config(layout="wide")
-st.title("Interactive Decline Curve Analysis + WOR Forecast")
+st.title("Interactive Decline Curve Analysis + WOR Forecast (Step-Rate CumOil)")
 st.caption(
     "Use box/lasso selection on each plot to choose the fit window. "
-    "Tab 3 uses straight-line ln(WOR) fitting and stops WOR forecast at your selected end date."
+    "This version computes cumulative oil with the step-rate method. "
+    "Tabs 3 and 4 require a saved oil-rate forecast from Tab 1 or Tab 2."
 )
 
 st.sidebar.header("Data")
@@ -788,7 +977,7 @@ active_forecast_uplifts = [ev for ev in forecast_uplifts if float(ev.get("rate",
 df["CumOil"] = running_cumulative(df["Date"], df["OIL"])
 df["WOR"] = np.where((df["OIL"] > 0) & (df["WATER"] >= 0), df["WATER"] / df["OIL"], np.nan)
 df["WaterCut"] = np.where(np.isfinite(df["WOR"]) & (df["WOR"] >= 0), watercut_from_wor(df["WOR"]), np.nan)
-df["lnWOR"] = np.where(df["WOR"] > 0, np.log(df["WOR"]), np.nan)
+df["lnWORp1"] = np.where(np.isfinite(df["WOR"]) & (df["WOR"] >= 0), np.log1p(df["WOR"]), np.nan)
 df["PointID"] = df.index.astype(int)
 
 fit_window_mode = st.sidebar.radio(
@@ -814,15 +1003,72 @@ else:
     manual_fit_start = min_date
     manual_fit_end = max_date
 
+decline_model_choice = st.sidebar.selectbox(
+    "Decline model",
+    options=["Exponential", "Hyperbolic", "Harmonic"],
+    index=1,
+    help="Choose the Arps decline model to fit on the selected stable period.",
+)
+
+forecast_anchor_mode_choice = st.sidebar.selectbox(
+    "Forecast anchoring mode",
+    options=["Practical re-anchored", "Rigorous parameter preservation"],
+    index=0,
+    help=(
+        "Practical re-anchored: start forecast from last/manual rate using fitted Di and b. "
+        "Rigorous parameter preservation: preserve fitted Arps model at forecast start; for hyperbolic/harmonic this updates local D at the anchor date."
+    ),
+)
+
+st.sidebar.caption("All calculations are internally converted to years.")
+
+show_prediction_cases = st.sidebar.checkbox(
+    "Show P10 / P50 / P90 prediction cases",
+    value=True,
+    help="Creates simple forecast sensitivity cases by varying decline rate around the base forecast.",
+)
+show_prediction_band = st.sidebar.checkbox(
+    "Shade P10-P90 band",
+    value=True,
+    help="Displays the uncertainty envelope between P10 and P90 on forecast plots.",
+)
+p10_decline_multiplier = st.sidebar.number_input(
+    "P10 decline multiplier",
+    min_value=0.10,
+    max_value=2.00,
+    value=0.85,
+    step=0.05,
+    format="%.2f",
+    help="P10 is optimistic by default, so it usually uses lower decline than the base case.",
+)
+p90_decline_multiplier = st.sidebar.number_input(
+    "P90 decline multiplier",
+    min_value=0.10,
+    max_value=3.00,
+    value=1.15,
+    step=0.05,
+    format="%.2f",
+    help="P90 is conservative by default, so it usually uses higher decline than the base case.",
+)
+
 for key in ("sel_time", "sel_q_np", "sel_wor_np", "sel_wor_qo"):
     if key not in st.session_state:
         st.session_state[key] = []
+for key in ("run_pcases_tab1", "run_pcases_tab2"):
+    if key not in st.session_state:
+        st.session_state[key] = False
+if "wor_source_label" not in st.session_state:
+    st.session_state["wor_source_label"] = None
+if "wor_source_result" not in st.session_state:
+    st.session_state["wor_source_result"] = None
+
+st.caption("All calculations are internally converted to years.")
 
 tab1, tab2, tab3, tab4 = st.tabs(
     [
         "1) Oil Rate vs Time",
         "2) Cum Oil vs Oil Rate",
-        "3) ln(WOR) vs Cum Oil",
+        "3) ln(WOR+1) vs Cum Oil",
         "4) Oil Rate from WOR + Liquid",
     ]
 )
@@ -831,11 +1077,14 @@ tab1, tab2, tab3, tab4 = st.tabs(
 # Tab 1: Oil Rate vs Time + Optional Well Count
 # =========================================================
 with tab1:
-    left, right = st.columns([1, 5])
+    left, center, right = st.columns([1, 1, 4])
     with left:
         if st.button("Clear selection", key="clear_tab1"):
             st.session_state["sel_time"] = []
             st.rerun()
+    with center:
+        if st.button("Run Simulation", key="run_sim_tab1"):
+            st.session_state["run_pcases_tab1"] = True
     with right:
         tab1_start_rate = st.number_input(
             "First forecast point rate (at last historical date)",
@@ -844,8 +1093,10 @@ with tab1:
             step=25.0,
             format="%.2f",
             key="tab1_start_rate",
-            help="This anchors the first red forecast point to the last historical date.",
+            help="Used in Practical re-anchored mode. In Rigorous parameter preservation mode, the fitted model determines the start rate at forecast origin.",
         )
+        if forecast_anchor_mode_choice == "Rigorous parameter preservation":
+            st.caption("Manual start rate is ignored in rigorous mode; forecast starts from model-preserved anchor at last history date.")
 
     sel_mask_1, sel_start_1, sel_end_1 = mask_from_selection(df, st.session_state["sel_time"])
     if fit_window_mode == "Manual date range":
@@ -860,10 +1111,20 @@ with tab1:
             forecast_years=forecast_years,
             forecast_start_rate=tab1_start_rate,
             forecast_uplifts=forecast_uplifts if use_forecast_uplifts else None,
+            decline_model=decline_model_choice,
+            forecast_anchor_mode=forecast_anchor_mode_choice,
         )
+        prediction_cases_1 = None
+        if show_prediction_cases and st.session_state.get("run_pcases_tab1", False):
+            prediction_cases_1 = build_prediction_cases(
+                result_1,
+                p10_multiplier=p10_decline_multiplier,
+                p90_multiplier=p90_decline_multiplier,
+            )
         fit_error_1 = None
     except Exception as exc:
         result_1 = None
+        prediction_cases_1 = None
         fit_error_1 = str(exc)
 
     rows = 2 if well_df is not None else 1
@@ -933,6 +1194,59 @@ with tab1:
             col=1,
         )
 
+        if show_prediction_cases and prediction_cases_1 is not None:
+            if show_prediction_band:
+                fig1.add_trace(
+                    go.Scatter(
+                        x=prediction_cases_1["dates"],
+                        y=prediction_cases_1["cases"]["P90"]["rate"],
+                        mode="lines",
+                        line={"width": 0},
+                        hoverinfo="skip",
+                        showlegend=False,
+                        name="P10-P90 band upper",
+                        fill=None,
+                    ),
+                    row=1,
+                    col=1,
+                )
+                fig1.add_trace(
+                    go.Scatter(
+                        x=prediction_cases_1["dates"],
+                        y=prediction_cases_1["cases"]["P10"]["rate"],
+                        mode="lines",
+                        line={"width": 0},
+                        fill="tonexty",
+                        fillcolor="rgba(214, 39, 40, 0.12)",
+                        name="P10-P90 band",
+                        hoverinfo="skip",
+                    ),
+                    row=1,
+                    col=1,
+                )
+            fig1.add_trace(
+                go.Scatter(
+                    x=prediction_cases_1["dates"],
+                    y=prediction_cases_1["cases"]["P10"]["rate"],
+                    mode="lines",
+                    name="P10",
+                    line={"color": "#2CA02C", "dash": "dot", "width": 2},
+                ),
+                row=1,
+                col=1,
+            )
+            fig1.add_trace(
+                go.Scatter(
+                    x=prediction_cases_1["dates"],
+                    y=prediction_cases_1["cases"]["P90"]["rate"],
+                    mode="lines",
+                    name="P90",
+                    line={"color": "#9467BD", "dash": "dot", "width": 2},
+                ),
+                row=1,
+                col=1,
+            )
+
     if fit_start_1 is not None and fit_end_1 is not None:
         fig1.add_vrect(
             x0=fit_start_1,
@@ -995,6 +1309,9 @@ with tab1:
             f"Manual fit range active: {pd.to_datetime(fit_start_1).date()} to {pd.to_datetime(fit_end_1).date()}"
         )
 
+    if show_prediction_cases and not st.session_state.get("run_pcases_tab1", False):
+        st.info("Click Run Simulation to generate P10 / P50 / P90 forecast cases.")
+
     if fit_error_1:
         st.error(f"Fit error: {fit_error_1}")
     else:
@@ -1003,10 +1320,32 @@ with tab1:
             f"({len(result_1['fit_df'])} points)"
         )
 
-        c1, c2, c3 = st.columns(3)
+        c1, c2, c3, c4 = st.columns(4)
         c1.metric("qi", f"{result_1['fitted_params']['qi']:.2f}")
-        c2.metric("Di", f"{result_1['fitted_params']['Di']:.4f}")
-        c3.metric("b", f"{result_1['fitted_params']['b']:.3f}")
+        c2.metric("Di (1/year)", f"{result_1['fitted_params']['Di']:.4f}")
+        c3.metric("Effective annual decline", f"{100.0 * result_1['fitted_effective_annual_decline']:.2f}%")
+        c4.metric("b", f"{result_1['fitted_params']['b']:.3f}")
+        st.caption(f"Model: {result_1['decline_model']} | Forecast mode: {result_1['forecast_anchor_mode']}")
+        if result_1['forecast_anchor_mode'] == 'Rigorous parameter preservation':
+            st.caption(
+                f"Forecast starts from model-preserved anchor at last history date: q={result_1['forecast_start_rate']:.2f}, D={result_1['forecast_start_D']:.4f}, effective={100.0 * result_1['forecast_start_effective_annual_decline']:.2f}%, b={result_1['forecast_start_b']:.3f}."
+            )
+        else:
+            st.caption(
+                f"Forecast starts from selected rate anchor: q={result_1['forecast_start_rate']:.2f}, D={result_1['forecast_start_D']:.4f}, effective={100.0 * result_1['forecast_start_effective_annual_decline']:.2f}%, b={result_1['forecast_start_b']:.3f}."
+            )
+
+        if show_prediction_cases and prediction_cases_1 is not None:
+            case_rows_1 = []
+            for case_name in ("P10", "P50", "P90"):
+                rate_series = prediction_cases_1["cases"][case_name]["rate"]
+                case_rows_1.append({
+                    "Case": case_name,
+                    "Decline multiplier": prediction_cases_1["cases"][case_name]["multiplier"],
+                    "Start rate": float(rate_series[0]),
+                    "End rate": float(rate_series[-1]),
+                })
+            st.dataframe(pd.DataFrame(case_rows_1), use_container_width=True, hide_index=True)
 
         st.plotly_chart(
             cumulative_time_figure(
@@ -1018,6 +1357,11 @@ with tab1:
             key="cum_plot_tab1",
         )
 
+        if st.button("Use Tab 1 forecast in WOR tabs", key="save_tab1_to_wor"):
+            save_wor_source("Tab 1", result_1)
+        if st.session_state.get("wor_source_label") == "Tab 1":
+            st.caption("Active WOR source: saved forecast from Tab 1.")
+
         st.download_button(
             "Download forecast CSV (Tab 1)",
             data=convert_df_to_csv(forecast_download_frame(result_1)),
@@ -1026,16 +1370,26 @@ with tab1:
             key="dl_tab1_forecast",
         )
 
+        st.write("Current plot data:")
+        st.dataframe(
+            historical_plot_table(df).assign(Date=lambda x: pd.to_datetime(x["Date"]).dt.strftime("%Y-%m-%d")),
+            use_container_width=True,
+            hide_index=True,
+        )
+
 
 # =========================================================
 # Tab 2: Cum Oil vs Oil Rate
 # =========================================================
 with tab2:
-    left, right = st.columns([1, 5])
+    left, center, right = st.columns([1, 1, 4])
     with left:
         if st.button("Clear selection", key="clear_tab2"):
             st.session_state["sel_q_np"] = []
             st.rerun()
+    with center:
+        if st.button("Run Simulation", key="run_sim_tab2"):
+            st.session_state["run_pcases_tab2"] = True
     with right:
         tab2_start_rate = st.number_input(
             "First forecast point rate (at last historical date)",
@@ -1044,8 +1398,10 @@ with tab2:
             step=25.0,
             format="%.2f",
             key="tab2_start_rate",
-            help="This anchors the first red forecast point to the last historical date.",
+            help="Used in Practical re-anchored mode. In Rigorous parameter preservation mode, the fitted model determines the start rate at forecast origin.",
         )
+        if forecast_anchor_mode_choice == "Rigorous parameter preservation":
+            st.caption("Manual start rate is ignored in rigorous mode; forecast starts from model-preserved anchor at last history date.")
 
     sel_mask_2, sel_start_2, sel_end_2 = mask_from_selection(df, st.session_state["sel_q_np"])
     if fit_window_mode == "Manual date range":
@@ -1060,10 +1416,20 @@ with tab2:
             forecast_years=forecast_years,
             forecast_start_rate=tab2_start_rate,
             forecast_uplifts=forecast_uplifts if use_forecast_uplifts else None,
+            decline_model=decline_model_choice,
+            forecast_anchor_mode=forecast_anchor_mode_choice,
         )
+        prediction_cases_2 = None
+        if show_prediction_cases and st.session_state.get("run_pcases_tab2", False):
+            prediction_cases_2 = build_prediction_cases(
+                result_2,
+                p10_multiplier=p10_decline_multiplier,
+                p90_multiplier=p90_decline_multiplier,
+            )
         fit_error_2 = None
     except Exception as exc:
         result_2 = None
+        prediction_cases_2 = None
         fit_error_2 = str(exc)
 
     marker_colors = np.where(fit_mask_2, "#1f77b4", "#B0B0B0")
@@ -1101,6 +1467,58 @@ with tab2:
             )
         )
 
+        if show_prediction_cases and prediction_cases_2 is not None:
+            case_cums_2 = {}
+            for case_name in ("P10", "P50", "P90"):
+                case_rates = prediction_cases_2["cases"][case_name]["rate"][1:]
+                comb_dates = pd.concat([df["Date"], pd.Series(prediction_cases_2["dates"][1:])], ignore_index=True)
+                comb_rates = pd.concat([df["OIL"], pd.Series(case_rates)], ignore_index=True)
+                comb_cum = running_cumulative(comb_dates, comb_rates)
+                case_cums_2[case_name] = np.concatenate(([result_2["hist_actual_cum"][-1]], comb_cum[len(df):]))
+            if show_prediction_band:
+                fig2.add_trace(
+                    go.Scatter(
+                        x=case_cums_2["P90"],
+                        y=prediction_cases_2["cases"]["P90"]["rate"],
+                        mode="lines",
+                        line={"width": 0},
+                        hoverinfo="skip",
+                        showlegend=False,
+                        name="P10-P90 band upper",
+                        fill=None,
+                    )
+                )
+                fig2.add_trace(
+                    go.Scatter(
+                        x=case_cums_2["P10"],
+                        y=prediction_cases_2["cases"]["P10"]["rate"],
+                        mode="lines",
+                        line={"width": 0},
+                        fill="tonexty",
+                        fillcolor="rgba(214, 39, 40, 0.12)",
+                        name="P10-P90 band",
+                        hoverinfo="skip",
+                    )
+                )
+            fig2.add_trace(
+                go.Scatter(
+                    x=case_cums_2["P10"],
+                    y=prediction_cases_2["cases"]["P10"]["rate"],
+                    mode="lines",
+                    name="P10",
+                    line={"color": "#2CA02C", "dash": "dot", "width": 2},
+                )
+            )
+            fig2.add_trace(
+                go.Scatter(
+                    x=case_cums_2["P90"],
+                    y=prediction_cases_2["cases"]["P90"]["rate"],
+                    mode="lines",
+                    name="P90",
+                    line={"color": "#9467BD", "dash": "dot", "width": 2},
+                )
+            )
+
     fig2.update_layout(
         title="Cumulative Oil vs Oil Rate (select points for fit window)",
         height=600,
@@ -1131,6 +1549,9 @@ with tab2:
             f"Manual fit range active: {pd.to_datetime(fit_start_2).date()} to {pd.to_datetime(fit_end_2).date()}"
         )
 
+    if show_prediction_cases and not st.session_state.get("run_pcases_tab2", False):
+        st.info("Click Run Simulation to generate P10 / P50 / P90 forecast cases.")
+
     if fit_error_2:
         st.error(f"Fit error: {fit_error_2}")
     else:
@@ -1139,10 +1560,32 @@ with tab2:
             f"({len(result_2['fit_df'])} points)"
         )
 
-        c1, c2, c3 = st.columns(3)
+        c1, c2, c3, c4 = st.columns(4)
         c1.metric("qi", f"{result_2['fitted_params']['qi']:.2f}")
-        c2.metric("Di", f"{result_2['fitted_params']['Di']:.4f}")
-        c3.metric("b", f"{result_2['fitted_params']['b']:.3f}")
+        c2.metric("Di (1/year)", f"{result_2['fitted_params']['Di']:.4f}")
+        c3.metric("Effective annual decline", f"{100.0 * result_2['fitted_effective_annual_decline']:.2f}%")
+        c4.metric("b", f"{result_2['fitted_params']['b']:.3f}")
+        st.caption(f"Model: {result_2['decline_model']} | Forecast mode: {result_2['forecast_anchor_mode']}")
+        if result_2['forecast_anchor_mode'] == 'Rigorous parameter preservation':
+            st.caption(
+                f"Forecast starts from model-preserved anchor at last history date: q={result_2['forecast_start_rate']:.2f}, D={result_2['forecast_start_D']:.4f}, effective={100.0 * result_2['forecast_start_effective_annual_decline']:.2f}%, b={result_2['forecast_start_b']:.3f}."
+            )
+        else:
+            st.caption(
+                f"Forecast starts from selected rate anchor: q={result_2['forecast_start_rate']:.2f}, D={result_2['forecast_start_D']:.4f}, effective={100.0 * result_2['forecast_start_effective_annual_decline']:.2f}%, b={result_2['forecast_start_b']:.3f}."
+            )
+
+        if show_prediction_cases and prediction_cases_2 is not None:
+            case_rows_2 = []
+            for case_name in ("P10", "P50", "P90"):
+                rate_series = prediction_cases_2["cases"][case_name]["rate"]
+                case_rows_2.append({
+                    "Case": case_name,
+                    "Decline multiplier": prediction_cases_2["cases"][case_name]["multiplier"],
+                    "Start rate": float(rate_series[0]),
+                    "End rate": float(rate_series[-1]),
+                })
+            st.dataframe(pd.DataFrame(case_rows_2), use_container_width=True, hide_index=True)
 
         st.plotly_chart(
             cumulative_time_figure(
@@ -1154,6 +1597,11 @@ with tab2:
             key="cum_plot_tab2",
         )
 
+        if st.button("Use Tab 2 forecast in WOR tabs", key="save_tab2_to_wor"):
+            save_wor_source("Tab 2", result_2)
+        if st.session_state.get("wor_source_label") == "Tab 2":
+            st.caption("Active WOR source: saved forecast from Tab 2.")
+
         st.download_button(
             "Download forecast CSV (Tab 2)",
             data=convert_df_to_csv(forecast_download_frame(result_2)),
@@ -1162,166 +1610,202 @@ with tab2:
             key="dl_tab2_forecast",
         )
 
+        st.write("Current plot data:")
+        st.dataframe(
+            historical_plot_table(df).assign(Date=lambda x: pd.to_datetime(x["Date"]).dt.strftime("%Y-%m-%d")),
+            use_container_width=True,
+            hide_index=True,
+        )
+
 
 # =========================================================
-# Tab 3: ln(WOR) vs Cum Oil (Straight-Line Fit)
+# Tab 3: ln(WOR+1) vs Cum Oil (Straight-Line Fit)
 # =========================================================
 with tab3:
     st.latex(r"WOR = \frac{q_w}{q_o}")
     st.latex(r"WC = \frac{WOR}{1 + WOR}")
+    st.caption("Save an oil-rate forecast from Tab 1 or Tab 2 first. This tab uses that cumulative-oil path to forecast future WOR and water cut.")
 
-    wor_plot_df = df.loc[np.isfinite(df["lnWOR"])].copy()
+    wor_plot_df = df.loc[np.isfinite(df["lnWORp1"])].copy()
     if len(wor_plot_df) < 5:
-        st.error("Need at least 5 valid WOR points (qo > 0 and qw >= 0 with WOR > 0) to use this tab.")
+        st.error("Need at least 5 valid WOR points (qo > 0 and qw >= 0 with WOR >= 0) to use this tab.")
     else:
-        top_left, top_right = st.columns([1, 5])
-        with top_left:
-            if st.button("Clear selection", key="clear_tab3"):
-                st.session_state["sel_wor_np"] = []
-                st.rerun()
-        with top_right:
-            wor_forecast_end_date = st.date_input(
-                "WOR forecast end date",
-                value=(df["Date"].iloc[-1] + pd.DateOffset(years=5)).date(),
-                min_value=(df["Date"].iloc[-1] + pd.DateOffset(days=1)).date(),
-            )
-
-        sel_mask_3, sel_start_3, sel_end_3 = mask_from_selection(df, st.session_state["sel_wor_np"])
-        if fit_window_mode == "Manual date range":
-            fit_mask_3, fit_start_3, fit_end_3 = mask_from_date_range(df, manual_fit_start, manual_fit_end)
+        source_label_3, source_result_3 = get_saved_wor_source()
+        if source_result_3 is None:
+            st.warning("Save an oil-rate forecast from Tab 1 or Tab 2 before running the WOR forecast in this tab.")
         else:
-            fit_mask_3, fit_start_3, fit_end_3 = sel_mask_3, sel_start_3, sel_end_3
+            source_frame_3 = oil_forecast_frame_from_result(source_result_3, source_label_3)
+            source_end_date_3 = pd.to_datetime(source_frame_3["Date"].max())
 
-        try:
-            result_3 = build_wor_forecast(
-                df=df,
-                fit_mask=fit_mask_3,
-                forecast_end_date=pd.to_datetime(wor_forecast_end_date),
-            )
-            fit_error_3 = None
-        except Exception as exc:
-            result_3 = None
-            fit_error_3 = str(exc)
-
-        marker_colors = np.where(
-            fit_mask_3.loc[wor_plot_df.index].to_numpy(),
-            "#1f77b4",
-            "#B0B0B0",
-        )
-
-        fig3 = go.Figure()
-        fig3.add_trace(
-            go.Scatter(
-                x=wor_plot_df["CumOil"],
-                y=wor_plot_df["lnWOR"],
-                mode="markers",
-                name="Historical ln(WOR)",
-                customdata=wor_plot_df["PointID"],
-                marker={"size": 8, "color": marker_colors},
-                hovertemplate="Point=%{customdata}<br>CumOil=%{x:.2f}<br>ln(WOR)=%{y:.4f}<extra></extra>",
-            )
-        )
-
-        if result_3 is not None:
-            fit_np = result_3["fit_np"]
-            x_min = float(np.nanmin(wor_plot_df["CumOil"]))
-            x_max_hist = float(np.nanmax(wor_plot_df["CumOil"]))
-            x_max_fore = float(np.nanmax(result_3["forecast_df"]["Forecast_Cumulative_Oil"]))
-            x_line = np.linspace(x_min, max(x_max_hist, x_max_fore), 250)
-            y_line = fit_np["m_ln"] * x_line + fit_np["c_ln"]
-
-            fig3.add_trace(
-                go.Scatter(
-                    x=x_line,
-                    y=y_line,
-                    mode="lines",
-                    name="Best fit straight line",
-                    line={"color": "#0057B8", "width": 3},
+            top_left, top_right = st.columns([1, 5])
+            with top_left:
+                if st.button("Clear selection", key="clear_tab3"):
+                    st.session_state["sel_wor_np"] = []
+                    st.rerun()
+            with top_right:
+                wor_forecast_end_date = st.date_input(
+                    "WOR forecast end date",
+                    value=source_end_date_3.date(),
+                    min_value=(df["Date"].iloc[-1] + pd.DateOffset(days=1)).date(),
+                    max_value=source_end_date_3.date(),
                 )
+                st.caption(
+                    f"Using saved oil forecast from **{source_label_3}**. "
+                    f"Available through **{source_end_date_3.date()}**."
+                )
+
+            sel_mask_3, sel_start_3, sel_end_3 = mask_from_selection(df, st.session_state["sel_wor_np"])
+            if fit_window_mode == "Manual date range":
+                fit_mask_3, fit_start_3, fit_end_3 = mask_from_date_range(df, manual_fit_start, manual_fit_end)
+            else:
+                fit_mask_3, fit_start_3, fit_end_3 = sel_mask_3, sel_start_3, sel_end_3
+
+            try:
+                result_3 = build_wor_forecast_from_source_path(
+                    df=df,
+                    fit_mask=fit_mask_3,
+                    source_result=source_result_3,
+                    source_label=source_label_3,
+                    forecast_end_date=pd.to_datetime(wor_forecast_end_date),
+                )
+                fit_error_3 = None
+            except Exception as exc:
+                result_3 = None
+                fit_error_3 = str(exc)
+
+            marker_colors = np.where(
+                fit_mask_3.loc[wor_plot_df.index].to_numpy(),
+                "#1f77b4",
+                "#B0B0B0",
             )
+
+            fig3 = go.Figure()
             fig3.add_trace(
                 go.Scatter(
-                    x=result_3["forecast_df"]["Forecast_Cumulative_Oil"],
-                    y=np.log(np.clip(result_3["forecast_df"]["Forecast_WOR"], 1e-12, np.inf)),
-                    mode="lines",
-                    name="Forecast path",
-                    line={"color": "#D62728", "dash": "dash", "width": 3},
+                    x=wor_plot_df["CumOil"],
+                    y=wor_plot_df["lnWORp1"],
+                    mode="markers",
+                    name="Historical ln(WOR+1)",
+                    customdata=wor_plot_df["PointID"],
+                    marker={"size": 8, "color": marker_colors},
+                    hovertemplate="Point=%{customdata}<br>CumOil=%{x:.2f}<br>ln(WOR+1)=%{y:.4f}<extra></extra>",
                 )
             )
 
-        fig3.update_layout(
-            title="ln(WOR) vs Cumulative Oil (select points for fit window)",
-            height=620,
-            template="plotly_white",
-            dragmode="select",
-            legend={"orientation": "h", "yanchor": "bottom", "y": 1.02, "xanchor": "right", "x": 1},
-        )
-        fig3.update_xaxes(title_text="Cumulative Oil")
-        fig3.update_yaxes(title_text="ln(WOR)")
+            if result_3 is not None:
+                fit_np = result_3["fit_np"]
+                x_min = float(np.nanmin(wor_plot_df["CumOil"]))
+                x_max_hist = float(np.nanmax(wor_plot_df["CumOil"]))
+                x_max_fore = float(np.nanmax(result_3["forecast_df"]["Forecast_Cumulative_Oil"]))
+                x_line = np.linspace(x_min, max(x_max_hist, x_max_fore), 250)
+                y_line = fit_np["m_log1p"] * x_line + fit_np["c_log1p"]
 
-        st.plotly_chart(
-            fig3,
-            use_container_width=True,
-            key="plot_tab3",
-            on_select=lambda: store_selection_from_widget("plot_tab3", "sel_wor_np"),
-            selection_mode=("points", "box", "lasso"),
-        )
+                fig3.add_trace(
+                    go.Scatter(
+                        x=x_line,
+                        y=y_line,
+                        mode="lines",
+                        name="Best fit straight line",
+                        line={"color": "#0057B8", "width": 3},
+                    )
+                )
+                fig3.add_trace(
+                    go.Scatter(
+                        x=result_3["forecast_df"]["Forecast_Cumulative_Oil"],
+                        y=result_3["forecast_df"]["Forecast_lnWORp1"],
+                        mode="lines",
+                        name="Forecast path",
+                        line={"color": "#D62728", "dash": "dash", "width": 3},
+                    )
+                )
 
-        if fit_window_mode == "Manual date range":
-            st.caption(
-                f"Manual fit range active: {pd.to_datetime(fit_start_3).date()} to {pd.to_datetime(fit_end_3).date()}"
+            fig3.update_layout(
+                title="ln(WOR+1) vs Cumulative Oil (select points for fit window)",
+                height=620,
+                template="plotly_white",
+                dragmode="select",
+                legend={"orientation": "h", "yanchor": "bottom", "y": 1.02, "xanchor": "right", "x": 1},
             )
+            fig3.update_xaxes(title_text="Cumulative Oil")
+            fig3.update_yaxes(title_text="ln(WOR+1)")
 
-        if fit_error_3:
-            st.error(f"Fit error: {fit_error_3}")
-        else:
-            fit_np = result_3["fit_np"]
-            fit_time = result_3["fit_time"]
-            forecast_table = result_3["forecast_df"].copy()
-            end_report = result_3["end_report"]
-
-            st.write(
-                f"Fit window: **{fit_np['fit_start'].date()}** to **{fit_np['fit_end'].date()}** "
-                f"({len(fit_np['fit_df'])} valid WOR points)"
-            )
-
-            m1, m2, m3, m4 = st.columns(4)
-            m1.metric("m (Np line)", f"{fit_np['m_ln']:.6g}")
-            m2.metric("c (Np line)", f"{fit_np['c_ln']:.6g}")
-            m3.metric("R2 Np-line", "N/A" if pd.isna(fit_np["r2_log"]) else f"{fit_np['r2_log']:.4f}")
-            m4.metric("R2 time-line", "N/A" if pd.isna(fit_time["r2_log"]) else f"{fit_time['r2_log']:.4f}")
-
-            st.code(
-                f"ln(WOR) = {fit_np['m_ln']:.6g} * CumOil + {fit_np['c_ln']:.6g}\n"
-                f"ln(WOR) = {fit_time['m_ln_time']:.6g} * t_years + {fit_time['c_ln_time']:.6g}\n"
-                f"CumOil = (ln(WOR) - {fit_np['c_ln']:.6g}) / {fit_np['m_ln']:.6g}",
-                language="text",
-            )
-
-            st.write("Reported values at the forecast stop date:")
-            end_df = pd.DataFrame([end_report])
-            st.dataframe(
-                end_df.assign(Date=lambda x: pd.to_datetime(x["Date"]).dt.strftime("%Y-%m-%d")),
+            st.plotly_chart(
+                fig3,
                 use_container_width=True,
-                hide_index=True,
+                key="plot_tab3",
+                on_select=lambda: store_selection_from_widget("plot_tab3", "sel_wor_np"),
+                selection_mode=("points", "box", "lasso"),
             )
 
-            st.write("Forecast table (cumulative oil computed from WOR fit inversion):")
-            st.dataframe(
-                forecast_table.assign(Date=lambda x: x["Date"].dt.strftime("%Y-%m-%d")),
-                use_container_width=True,
-                hide_index=True,
-            )
+            if fit_window_mode == "Manual date range":
+                st.caption(
+                    f"Manual fit range active: {pd.to_datetime(fit_start_3).date()} to {pd.to_datetime(fit_end_3).date()}"
+                )
 
-            wor_download = forecast_table.copy()
-            wor_download["Date"] = wor_download["Date"].dt.strftime("%Y-%m-%d")
-            st.download_button(
-                "Download forecast CSV (Tab 3)",
-                data=convert_df_to_csv(wor_download),
-                file_name="forecast_tab3_wor_vs_cumoil.csv",
-                mime="text/csv",
-                key="dl_tab3_forecast",
-            )
+            if fit_error_3:
+                st.error(f"Fit error: {fit_error_3}")
+            else:
+                fit_np = result_3["fit_np"]
+                forecast_table = result_3["forecast_df"][
+                    [
+                        "Date",
+                        "Oil_Forecast_Source",
+                        "Source_Forecast_OilRate",
+                        "Forecast_Cumulative_Oil",
+                        "Forecast_WOR",
+                        "Forecast_WaterCut",
+                    ]
+                ].copy()
+                end_report = result_3["end_report"]
+
+                st.write(
+                    f"Fit window: **{fit_np['fit_start'].date()}** to **{fit_np['fit_end'].date()}** "
+                    f"({len(fit_np['fit_df'])} valid WOR points)"
+                )
+
+                m1, m2, m3 = st.columns(3)
+                m1.metric("m (Np line)", f"{fit_np['m_log1p']:.6g}")
+                m2.metric("c (Np line)", f"{fit_np['c_log1p']:.6g}")
+                m3.metric("R2 Np-line", "N/A" if pd.isna(fit_np["r2_log1p"]) else f"{fit_np['r2_log1p']:.4f}")
+
+                st.code(
+                    f"ln(WOR+1) = {fit_np['m_log1p']:.6g} * CumOil + {fit_np['c_log1p']:.6g}\n"
+                    "WOR = exp(ln(WOR+1)) - 1\n"
+                    "WaterCut = WOR / (1 + WOR)",
+                    language="text",
+                )
+
+                st.write("Reported values at the forecast stop date:")
+                end_df = pd.DataFrame([end_report])
+                st.dataframe(
+                    end_df.assign(Date=lambda x: pd.to_datetime(x["Date"]).dt.strftime("%Y-%m-%d")),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+                st.write("Forecast table (future water cut from the saved oil-forecast cumulative path):")
+                st.dataframe(
+                    forecast_table.assign(Date=lambda x: x["Date"].dt.strftime("%Y-%m-%d")),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+                st.write("Current plot data:")
+                st.dataframe(
+                    historical_plot_table(wor_plot_df).assign(Date=lambda x: pd.to_datetime(x["Date"]).dt.strftime("%Y-%m-%d")),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+                wor_download = forecast_table.copy()
+                wor_download["Date"] = wor_download["Date"].dt.strftime("%Y-%m-%d")
+                st.download_button(
+                    "Download forecast CSV (Tab 3)",
+                    data=convert_df_to_csv(wor_download),
+                    file_name="forecast_tab3_watercut_from_oil_forecast.csv",
+                    mime="text/csv",
+                    key="dl_tab3_forecast",
+                )
 
 
 # =========================================================
@@ -1331,9 +1815,9 @@ with tab4:
     st.latex(r"q_o = \frac{q_l}{1 + WOR}")
     st.caption("Use forecasted WOR and a piecewise-constant liquid-rate schedule to forecast oil rate.")
 
-    wor_plot_df_4 = df.loc[np.isfinite(df["lnWOR"])].copy()
+    wor_plot_df_4 = df.loc[np.isfinite(df["lnWORp1"])].copy()
     if len(wor_plot_df_4) < 5:
-        st.error("Need at least 5 valid WOR points (qo > 0 and qw >= 0 with WOR > 0) to use this tab.")
+        st.error("Need at least 5 valid WOR points (qo > 0 and qw >= 0 with WOR >= 0) to use this tab.")
     else:
         hist_last_date = pd.to_datetime(df["Date"].iloc[-1])
         default_end_date_4 = (hist_last_date + pd.DateOffset(years=5)).date()
@@ -1434,12 +1918,12 @@ with tab4:
         fig4_fit.add_trace(
             go.Scatter(
                 x=wor_plot_df_4["CumOil"],
-                y=wor_plot_df_4["lnWOR"],
+                y=wor_plot_df_4["lnWORp1"],
                 mode="markers",
-                name="Historical ln(WOR)",
+                name="Historical ln(WOR+1)",
                 customdata=wor_plot_df_4["PointID"],
                 marker={"size": 8, "color": marker_colors_4},
-                hovertemplate="Point=%{customdata}<br>CumOil=%{x:.2f}<br>ln(WOR)=%{y:.4f}<extra></extra>",
+                hovertemplate="Point=%{customdata}<br>CumOil=%{x:.2f}<br>ln(WOR+1)=%{y:.4f}<extra></extra>",
             )
         )
 
@@ -1449,21 +1933,21 @@ with tab4:
             x_max_hist_4 = float(np.nanmax(wor_plot_df_4["CumOil"]))
             x_max_fore_4 = float(np.nanmax(result_4["forecast_df"]["Forecast_Cumulative_Oil"]))
             x_line_4 = np.linspace(x_min_4, max(x_max_hist_4, x_max_fore_4), 250)
-            y_line_4 = fit_np_4["m_ln"] * x_line_4 + fit_np_4["c_ln"]
+            y_line_4 = fit_np_4["m_log1p"] * x_line_4 + fit_np_4["c_log1p"]
 
             fig4_fit.add_trace(
                 go.Scatter(
                     x=x_line_4,
                     y=y_line_4,
                     mode="lines",
-                    name="Best fit ln(WOR) line",
+                    name="Best fit ln(WOR+1) line",
                     line={"color": "#0057B8", "width": 3},
                 )
             )
             fig4_fit.add_trace(
                 go.Scatter(
                     x=result_4["forecast_df"]["Forecast_Cumulative_Oil"],
-                    y=np.log(np.clip(result_4["forecast_df"]["Forecast_WOR"], 1e-12, np.inf)),
+                    y=np.log1p(result_4["forecast_df"]["Forecast_WOR"]),
                     mode="lines",
                     name="Forecast WOR path",
                     line={"color": "#D62728", "dash": "dash", "width": 3},
@@ -1471,14 +1955,14 @@ with tab4:
             )
 
         fig4_fit.update_layout(
-            title="ln(WOR) vs Cumulative Oil (fit used for oil-rate-from-liquid forecast)",
+            title="ln(WOR+1) vs Cumulative Oil (fit used for oil-rate-from-liquid forecast)",
             height=560,
             template="plotly_white",
             dragmode="select",
             legend={"orientation": "h", "yanchor": "bottom", "y": 1.02, "xanchor": "right", "x": 1},
         )
         fig4_fit.update_xaxes(title_text="Cumulative Oil")
-        fig4_fit.update_yaxes(title_text="ln(WOR)")
+        fig4_fit.update_yaxes(title_text="ln(WOR+1)")
 
         st.plotly_chart(
             fig4_fit,
